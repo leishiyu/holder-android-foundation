@@ -53,6 +53,7 @@ import java.io.PrintWriter;
 import java.io.UnsupportedEncodingException;
 import java.lang.ref.WeakReference;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
@@ -289,12 +290,11 @@ public final class USBMonitor {
 	}
 
 	/**
-	 * return device list, return empty list if no device matched
+	 * return device list, return empty list if no device matched or already destroyed
 	 * @return
-	 * @throws IllegalStateException
 	 */
-	public List<UsbDevice> getDeviceList() throws IllegalStateException {
-		if (destroyed) throw new IllegalStateException("already destroyed");
+	public List<UsbDevice> getDeviceList() {
+		if (destroyed) return Collections.emptyList();
 		return getDeviceList(mDeviceFilters);
 	}
 
@@ -449,11 +449,10 @@ public final class USBMonitor {
 	/**
 	 * return whether the specific Usb device has permission
 	 * @param device
-	 * @return true: 指定したUsbDeviceにパーミッションがある
-	 * @throws IllegalStateException
+	 * @return true: 指定したUsbDeviceにパーミッションがある, false if destroyed or no permission
 	 */
-	public final boolean hasPermission(final UsbDevice device) throws IllegalStateException {
-		if (destroyed) throw new IllegalStateException("already destroyed");
+	public final boolean hasPermission(final UsbDevice device) {
+		if (destroyed) return false;
 		return updatePermission(device, device != null && mUsbManager.hasPermission(device));
 	}
 
