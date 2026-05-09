@@ -89,6 +89,7 @@ class UvcCameraDriver(
     private var captureWaiter: CompletableDeferred<CameraFrame>? = null
     private var startWaiter: CompletableDeferred<Unit>? = null
     private var lastFrameAtMs: Long = 0L
+    @Volatile
     private var closed = false
 
     override suspend fun bind(host: PreviewHost, config: CameraConfig) {
@@ -118,7 +119,13 @@ class UvcCameraDriver(
             startWaiter = null
             throw CameraException.DeviceUnavailableException("Failed to request USB permission for UVC camera.")
         }
-        waiter.await()
+        try {
+            waiter.await()
+        } finally {
+            if (startWaiter === waiter) {
+                startWaiter = null
+            }
+        }
     }
 
     override suspend fun stop() {
@@ -241,10 +248,19 @@ class UvcCameraDriver(
     }
 
     private fun openCamera(controlBlock: USBMonitor.UsbControlBlock) {
+        if (closed) {
+            controlBlock.close()
+            return
+        }
         releaseCamera()
         val camera = UVCCamera()
         try {
             camera.open(controlBlock)
+            if (closed) {
+                camera.close()
+                camera.destroy()
+                return
+            }
             configurePreviewSize(camera)
             camera.setFrameCallback({ buffer ->
                 handleFrame(buffer, currentConfig?.frameDeliveryConfig ?: FrameDeliveryConfig.DISABLED)
@@ -257,8 +273,15 @@ class UvcCameraDriver(
         openCamera = camera
 
         val currentSurface = surface
-        if (currentSurface != null) {
+        if (closed) {
+            releaseCamera()
+            return
+        } else if (currentSurface != null) {
             camera.setPreviewDisplay(currentSurface)
+            if (closed) {
+                releaseCamera()
+                return
+            }
             camera.startPreview()
             scope.launch {
                 startWaiter?.complete(Unit)
@@ -296,6 +319,9 @@ class UvcCameraDriver(
         buffer: ByteBuffer,
         frameConfig: FrameDeliveryConfig,
     ) {
+        if (closed) {
+            return
+        }
         try {
             val length = buffer.capacity()
             val bytes = ByteArray(length)
@@ -336,6 +362,9 @@ class UvcCameraDriver(
     private fun releaseCamera() {
         pendingControlBlock = null
         openCamera?.let { camera ->
+            runCatching {
+                camera.setFrameCallback(null, 0)
+            }
             runCatching {
                 camera.stopPreview()
             }
@@ -407,7 +436,7 @@ class UvcCameraDriver(
         override fun onAttach(device: UsbDevice) = Unit
 
         override fun onDettach(device: UsbDevice) {
-            if (device.deviceId == selectedDevice?.deviceId) {
+            if (!closed && device.deviceId == selectedDevice?.deviceId) {
                 releaseCamera()
             }
         }
@@ -417,6 +446,10 @@ class UvcCameraDriver(
             ctrlBlock: USBMonitor.UsbControlBlock,
             createNew: Boolean,
         ) {
+            if (closed) {
+                ctrlBlock.close()
+                return
+            }
             if (device.deviceId != selectedDevice?.deviceId) {
                 return
             }
@@ -437,7 +470,7 @@ class UvcCameraDriver(
         }
 
         override fun onDisconnect(device: UsbDevice, ctrlBlock: USBMonitor.UsbControlBlock) {
-            if (device.deviceId == selectedDevice?.deviceId) {
+            if (!closed && device.deviceId == selectedDevice?.deviceId) {
                 releaseCamera()
                 scope.launch {
                     eventFlow.emit(CameraEvent.PreviewStopped(backend))
@@ -446,7 +479,7 @@ class UvcCameraDriver(
         }
 
         override fun onCancel(device: UsbDevice) {
-            if (device.deviceId == selectedDevice?.deviceId) {
+            if (!closed && device.deviceId == selectedDevice?.deviceId) {
                 scope.launch {
                     startWaiter?.completeExceptionally(CameraException.PermissionDeniedException())
                     startWaiter = null
@@ -458,6 +491,13 @@ class UvcCameraDriver(
     private inner class PreviewTextureListener : TextureView.SurfaceTextureListener {
         override fun onSurfaceTextureAvailable(surfaceTexture: SurfaceTexture, width: Int, height: Int) {
             surface = Surface(surfaceTexture)
+            if (closed) {
+                surface?.release()
+                surface = null
+                pendingControlBlock?.close()
+                pendingControlBlock = null
+                return
+            }
             pendingControlBlock?.let { controlBlock ->
                 pendingControlBlock = null
                 runCatching {

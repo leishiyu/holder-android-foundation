@@ -122,6 +122,8 @@ class DefaultCameraController(
             return
         }
 
+        closeActiveDriverForInterrupt()
+
         val deferred = CompletableDeferred<Unit>()
         commandChannel.trySend(ControllerCommand.Close(deferred))
         commandChannel.close()
@@ -282,6 +284,27 @@ class DefaultCameraController(
                 if (exception !is CancellationException) {
                     logger.error("CameraController", "Failed to close driver.", exception)
                 }
+            }
+        }
+    }
+
+    private fun closeActiveDriverForInterrupt() {
+        val closeAction = {
+            activeDriver?.let { driver ->
+                try {
+                    driver.close()
+                } catch (exception: Throwable) {
+                    if (exception !is CancellationException) {
+                        logger.error("CameraController", "Failed to interrupt active driver.", exception)
+                    }
+                }
+            }
+        }
+        if (!hasMainLooper() || isMainThread()) {
+            closeAction()
+        } else {
+            runBlocking(Dispatchers.Main.immediate) {
+                closeAction()
             }
         }
     }
