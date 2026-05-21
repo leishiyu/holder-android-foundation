@@ -63,7 +63,7 @@ interface CameraController : AutoCloseable {
     suspend fun queryAvailableCameras(): List<AvailableCamera>
 
     /**
-     * Captures an image according to the requested mode.
+     * Captures a JPEG snapshot from the active camera output frame.
      */
     suspend fun capture(request: CaptureRequest): CaptureResult
 

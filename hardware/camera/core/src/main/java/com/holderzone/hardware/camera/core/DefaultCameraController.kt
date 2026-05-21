@@ -323,21 +323,9 @@ class DefaultCameraController(
     private fun validateCaptureRequest(driver: CameraDriver, request: CaptureRequest) {
         val capability = driver.capabilities
         when (request) {
-            is CaptureRequest.RequireStill -> if (!capability.stillCapture) {
+            is CaptureRequest.Snapshot -> if (!capability.snapshotCapture) {
                 throw CameraException.CaptureFailureException(
-                    "Backend ${driver.backend} does not support still capture."
-                )
-            }
-
-            is CaptureRequest.PreviewSnapshot -> if (!capability.previewSnapshot) {
-                throw CameraException.CaptureFailureException(
-                    "Backend ${driver.backend} does not support preview snapshots."
-                )
-            }
-
-            is CaptureRequest.PreferStill -> if (!capability.stillCapture && !capability.previewSnapshot) {
-                throw CameraException.CaptureFailureException(
-                    "Backend ${driver.backend} cannot satisfy capture requests."
+                    "Backend ${driver.backend} does not support snapshots."
                 )
             }
         }

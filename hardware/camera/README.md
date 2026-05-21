@@ -10,8 +10,8 @@ hardware/camera
   core            # CameraController 状态机、能力协商、资源回收
   view            # CameraPreviewView
   compose         # CameraPreview(controller, modifier)
-  driver-camerax  # 默认内置相机实现，支持 still capture
-  driver-camera2  # Camera2 fallback，首版以 preview snapshot 为主
+  driver-camerax  # 默认内置相机实现，基于输出帧保存 snapshot
+  driver-camera2  # Camera2 fallback，基于 ImageReader 输出帧保存 snapshot
   driver-uvc      # UVC 驱动、USBMonitor、native so、device filter
   face-mlkit      # 可选人脸分析扩展
 ```
@@ -72,6 +72,12 @@ val controller = CameraControllerFactory.create(
     config = CameraConfig(
         backendPreference = CameraBackendPreference.AUTO,
         lensFacing = LensFacing.BACK,
+        captureSize = CameraSize.HD_720P,
+        jpegQuality = 95,
+        frameRotationDegrees = 0,
+        uvcFrameConfig = UvcFrameConfig(
+            yuvLayout = UvcYuvLayout.AUTO,
+        ),
         enableLogging = true,
     )
 )
@@ -82,7 +88,7 @@ CameraPreview(
 )
 
 val result = controller.capture(
-    CaptureRequest.PreferStill(
+    CaptureRequest.Snapshot(
         outputFile = File(
             applicationContext.getExternalFilesDir(Environment.DIRECTORY_PICTURES),
             "camera-sdk/manual_capture.jpg"
@@ -102,27 +108,39 @@ controller.switchToNextCamera()
 
 ## 能力语义
 
-- `CaptureRequest.RequireStill`
-  - 只接受真实 still capture
-  - 当前优先由 CameraX 满足
-- `CaptureRequest.PreferStill`
-  - 优先 still capture，不支持时回退到 snapshot
-- `CaptureRequest.PreviewSnapshot`
-  - 明确走预览截帧链路
+- `CaptureRequest.Snapshot`
+  - 所有 backend 统一保存当前相机输出帧
+  - Camera2 使用 `ImageReader` 帧，UVC 使用 frame callback 帧，CameraX 使用 `ImageAnalysis` 帧
+  - 不再暴露 still capture / view bitmap 截图语义
 - `queryAvailableCameras()`
   - 返回当前 backend 可选相机列表
 - `switchToNextCamera()`
   - 在当前 backend 内轮换到下一个相机
-- 三种请求都支持可选 `outputFile`
+- `Snapshot` 支持可选 `outputFile`
   - 不传时默认写入 `cacheDir/camera-sdk`
   - 传入后按调用方指定路径落盘，并自动创建父目录
+
+## 图像质量与方向
+
+- `CameraConfig.captureSize`
+  - 为空时使用低端机友好的默认尺寸：CameraX/Camera2 为 `1280x720`，UVC 为 `640x360`
+  - 传入 `CameraSize(width, height)` 时，各 backend 会选择最接近的设备支持尺寸
+- `CameraConfig.jpegQuality`
+  - 控制 snapshot JPEG 压缩质量，范围 `1..100`，默认 `95`
+- `CameraConfig.frameRotationDegrees`
+  - 用于校准设备输出帧方向，可选 `0`、`90`、`180`、`270`
+  - 对外 `frames` 会携带校准后的旋转角；保存 snapshot 时会将该旋转实际应用到 JPEG 像素
+- `CameraConfig.uvcFrameConfig`
+  - 仅影响 UVC backend，用于处理不同 UVC 设备输出的 YUV420SP UV 顺序差异
+  - 默认 `UvcYuvLayout.AUTO` 会在早期帧上启发式判断；置信度不足时回退到 `NV12_TO_NV21`
+  - 如果某些机型颜色仍偏绿、偏紫，可显式切到 `UvcYuvLayout.NV21_DIRECT` 或 `NV12_TO_NV21`
 
 ## 存储行为
 
 - 默认输出目录：
   - `<app cache dir>/camera-sdk`
 - 指定输出路径：
-  - 通过 `CaptureRequest.*(outputFile = File(...))` 传入
+  - 通过 `CaptureRequest.Snapshot(outputFile = File(...))` 传入
 - `CaptureResult.path`
   - 始终返回最终实际落盘路径
 

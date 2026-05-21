@@ -90,9 +90,9 @@ class DefaultCameraControllerTest {
 
         controller.bind(FakePreviewHost(context))
         val expectedOutput = File("build/test-custom-output.jpg")
-        val result = controller.capture(CaptureRequest.PreferStill(outputFile = expectedOutput))
+        val result = controller.capture(CaptureRequest.Snapshot(outputFile = expectedOutput))
 
-        assertEquals(CaptureKind.STILL, result.kind)
+        assertEquals(CaptureKind.SNAPSHOT, result.kind)
         assertEquals(1, driver.captureCount)
         assertEquals(expectedOutput, driver.lastRequest?.outputFile)
         controller.close()
@@ -155,8 +155,7 @@ class DefaultCameraControllerTest {
         override val capabilities: CameraCapability = CameraCapability(
             switchLens = true,
             switchCamera = true,
-            stillCapture = true,
-            previewSnapshot = true,
+            snapshotCapture = true,
             frameStreaming = true,
         )
         override val frames: Flow<CameraFrame> = emptyFlow()
@@ -201,7 +200,7 @@ class DefaultCameraControllerTest {
             lastRequest = request
             return CaptureResult(
                 path = "test.jpg",
-                kind = CaptureKind.STILL,
+                kind = CaptureKind.SNAPSHOT,
                 backend = backend,
             )
         }

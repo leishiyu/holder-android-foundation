@@ -52,6 +52,8 @@ import com.holderzone.hardware.camera.CameraEvent
 import com.holderzone.hardware.camera.CameraState
 import com.holderzone.hardware.camera.CaptureRequest
 import com.holderzone.hardware.camera.LensFacing
+import com.holderzone.hardware.camera.UvcFrameConfig
+import com.holderzone.hardware.camera.UvcYuvLayout
 import com.holderzone.hardware.camera.compose.CameraPreview
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.launch
@@ -111,6 +113,9 @@ private fun CameraSdkSampleScreen() {
             config = CameraConfig(
                 backendPreference = CameraBackendPreference.AUTO,
                 lensFacing = LensFacing.BACK,
+                uvcFrameConfig = UvcFrameConfig(
+                    yuvLayout = UvcYuvLayout.AUTO,
+                ),
                 enableLogging = false,
             )
         )
@@ -186,7 +191,7 @@ private fun CameraSdkSampleScreen() {
                     }
                 ) {
                     capture(
-                        CaptureRequest.PreferStill(
+                        CaptureRequest.Snapshot(
                             outputFile = context.createSampleCaptureFile()
                         )
                     )
@@ -309,10 +314,9 @@ private fun StatusCard(
             StatusLine(label = "State", value = state.toReadableText())
             StatusLine(label = "Switch Lens", value = capabilities.switchLens.toEnabledText())
             StatusLine(label = "Switch Camera", value = capabilities.switchCamera.toEnabledText())
-            StatusLine(label = "Still Capture", value = capabilities.stillCapture.toEnabledText())
             StatusLine(
-                label = "Preview Snapshot",
-                value = capabilities.previewSnapshot.toEnabledText()
+                label = "Snapshot",
+                value = capabilities.snapshotCapture.toEnabledText()
             )
             StatusLine(
                 label = "Frame Streaming",

@@ -15,23 +15,9 @@ sealed interface CaptureRequest {
     val outputFile: File?
 
     /**
-     * Uses still capture when supported and falls back to a preview snapshot otherwise.
+     * Captures the current camera output frame as a JPEG snapshot.
      */
-    data class PreferStill(
-        override val outputFile: File? = null,
-    ) : CaptureRequest
-
-    /**
-     * Requires a true still capture path from the active backend.
-     */
-    data class RequireStill(
-        override val outputFile: File? = null,
-    ) : CaptureRequest
-
-    /**
-     * Captures the current preview image instead of using the still capture pipeline.
-     */
-    data class PreviewSnapshot(
+    data class Snapshot(
         override val outputFile: File? = null,
     ) : CaptureRequest
 }

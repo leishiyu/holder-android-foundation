@@ -8,16 +8,16 @@ import java.io.File
 class CaptureRequestTest {
 
     @Test
-    fun preferStill_defaultsToSdkManagedOutput() {
-        val request = CaptureRequest.PreferStill()
+    fun snapshot_defaultsToSdkManagedOutput() {
+        val request = CaptureRequest.Snapshot()
 
         assertNull(request.outputFile)
     }
 
     @Test
-    fun previewSnapshot_keepsCallerProvidedOutputFile() {
+    fun snapshot_keepsCallerProvidedOutputFile() {
         val target = File("custom/output/path.jpg")
-        val request = CaptureRequest.PreviewSnapshot(outputFile = target)
+        val request = CaptureRequest.Snapshot(outputFile = target)
 
         assertEquals(target, request.outputFile)
     }

@@ -3,12 +3,11 @@ package com.holderzone.hardware.camera.driver.camerax
 import android.Manifest
 import android.content.Context
 import android.content.pm.PackageManager
-import android.graphics.Bitmap
-import android.graphics.ImageFormat
-import android.graphics.Rect
-import android.graphics.YuvImage
+import android.hardware.camera2.CameraCharacteristics
+import android.hardware.camera2.CameraManager
 import android.os.Handler
 import android.os.Looper
+import android.util.Size
 import android.view.View
 import android.view.ViewTreeObserver
 import androidx.camera.camera2.interop.Camera2CameraInfo
@@ -16,11 +15,12 @@ import androidx.camera.core.Camera
 import androidx.camera.core.CameraInfo
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.ImageAnalysis
-import androidx.camera.core.ImageCapture
-import androidx.camera.core.ImageCaptureException
 import androidx.camera.core.ImageProxy
 import androidx.camera.core.Preview
 import androidx.camera.lifecycle.ProcessCameraProvider
+import androidx.camera.core.resolutionselector.AspectRatioStrategy
+import androidx.camera.core.resolutionselector.ResolutionSelector
+import androidx.camera.core.resolutionselector.ResolutionStrategy
 import androidx.camera.view.PreviewView
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.Lifecycle
@@ -40,6 +40,7 @@ import com.holderzone.hardware.camera.CaptureResult
 import com.holderzone.hardware.camera.FrameDeliveryConfig
 import com.holderzone.hardware.camera.LensFacing
 import com.holderzone.hardware.camera.PreviewHost
+import com.holderzone.hardware.camera.internal.saveAsJpeg
 import com.holderzone.hardware.camera.internal.log.CameraLogger
 import com.holderzone.hardware.camera.internal.spi.CameraDriver
 import kotlinx.coroutines.CompletableDeferred
@@ -55,11 +56,7 @@ import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withTimeout
-import java.io.ByteArrayOutputStream
 import java.io.File
-import java.io.FileOutputStream
-import android.hardware.camera2.CameraCharacteristics
-import android.hardware.camera2.CameraManager
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
@@ -76,14 +73,18 @@ class CameraXCameraDriver(
     private val logger: CameraLogger,
 ) : CameraDriver {
 
+    private companion object {
+        val DEFAULT_CAPTURE_SIZE = Size(1280, 720)
+        const val SNAPSHOT_FRAME_TIMEOUT_MILLIS = 2_000L
+    }
+
     private val cameraManager = appContext.getSystemService(Context.CAMERA_SERVICE) as CameraManager
 
     override val backend: CameraBackend = CameraBackend.CAMERA_X
     override val capabilities: CameraCapability = CameraCapability(
         switchLens = true,
         switchCamera = cameraManager.cameraIdList.size > 1,
-        stillCapture = true,
-        previewSnapshot = true,
+        snapshotCapture = true,
         frameStreaming = true,
         uvcSelection = false,
     )
@@ -103,13 +104,14 @@ class CameraXCameraDriver(
     private var previewView: PreviewView? = null
     private var cameraProvider: ProcessCameraProvider? = null
     private var preview: Preview? = null
-    private var imageCapture: ImageCapture? = null
     private var imageAnalysis: ImageAnalysis? = null
     private var camera: Camera? = null
     private var currentConfig: CameraConfig? = null
     private var currentLensFacing: LensFacing = LensFacing.BACK
     private var selectedCameraId: String? = null
     private var activeCameraId: String? = null
+    private var latestFrame: CameraFrame? = null
+    private var captureWaiter: CompletableDeferred<CameraFrame>? = null
     private var lastFrameAtMs: Long = 0L
     private var closed = false
 
@@ -191,10 +193,12 @@ class CameraXCameraDriver(
         cameraProvider?.unbindAll()
         lifecycleOwner.moveToCreated()
         preview = null
-        imageCapture = null
         imageAnalysis = null
         camera = null
         activeCameraId = null
+        latestFrame = null
+        captureWaiter?.cancel()
+        captureWaiter = null
         eventFlow.emit(CameraEvent.PreviewStopped(backend))
     }
 
@@ -237,12 +241,18 @@ class CameraXCameraDriver(
 
     override suspend fun capture(request: CaptureRequest): CaptureResult {
         ensureOpen()
-        return when (request) {
-            is CaptureRequest.PreviewSnapshot -> capturePreviewSnapshot(request)
-            is CaptureRequest.PreferStill,
-            is CaptureRequest.RequireStill,
-            -> captureStill(request)
-        }
+        val file = resolveOutputFile(
+            requestedFile = request.outputFile,
+            prefix = "camerax_snapshot",
+        )
+        val config = currentConfig ?: CameraConfig()
+        val frame = latestFrame ?: awaitSnapshotFrame()
+        frame.saveAsJpeg(file, config.jpegQuality, frame.rotationDegrees)
+        return CaptureResult(
+            path = file.absolutePath,
+            kind = CaptureKind.SNAPSHOT,
+            backend = backend,
+        )
     }
 
     override fun close() {
@@ -260,9 +270,11 @@ class CameraXCameraDriver(
             previewView = null
             cameraProvider?.unbindAll()
             preview = null
-            imageCapture = null
             imageAnalysis = null
             camera = null
+            latestFrame = null
+            captureWaiter?.cancel()
+            captureWaiter = null
             lifecycleOwner.destroy()
         }
 
@@ -284,77 +296,27 @@ class CameraXCameraDriver(
         scope.cancel()
     }
 
-    private suspend fun captureStill(request: CaptureRequest): CaptureResult {
-        val capture = imageCapture ?: throw CameraException.CaptureFailureException(
-            "CameraX still capture is not ready."
-        )
-        val file = resolveOutputFile(
-            requestedFile = request.outputFile,
-            prefix = "camerax_still",
-        )
-        return suspendCancellableCoroutine { continuation ->
-            val output = ImageCapture.OutputFileOptions.Builder(file).build()
-            capture.takePicture(
-                output,
-                cameraExecutor,
-                object : ImageCapture.OnImageSavedCallback {
-                    override fun onError(exception: ImageCaptureException) {
-                        continuation.resumeWithException(
-                            CameraException.CaptureFailureException(
-                                "CameraX still capture failed.",
-                                exception,
-                            )
-                        )
-                    }
-
-                    override fun onImageSaved(outputFileResults: ImageCapture.OutputFileResults) {
-                        continuation.resume(
-                            CaptureResult(
-                                path = file.absolutePath,
-                                kind = CaptureKind.STILL,
-                                backend = backend,
-                            )
-                        )
-                    }
-                }
-            )
-        }
-    }
-
-    private suspend fun capturePreviewSnapshot(request: CaptureRequest): CaptureResult {
-        val bitmap = previewView?.bitmap ?: throw CameraException.CaptureFailureException(
-            "CameraX preview bitmap is not ready."
-        )
-        val file = resolveOutputFile(
-            requestedFile = request.outputFile,
-            prefix = "camerax_snapshot",
-        )
-        saveBitmap(bitmap, file)
-        return CaptureResult(
-            path = file.absolutePath,
-            kind = CaptureKind.SNAPSHOT,
-            backend = backend,
-        )
-    }
-
     private fun handleAnalysisFrame(
         imageProxy: ImageProxy,
         frameConfig: FrameDeliveryConfig,
     ) {
         try {
             val now = System.currentTimeMillis()
-            if (now - lastFrameAtMs < frameConfig.minIntervalMillis) {
-                return
-            }
-            lastFrameAtMs = now
+            val config = currentConfig ?: CameraConfig()
             val frame = CameraFrame(
                 nv21 = imageProxy.toNv21(),
                 width = imageProxy.width,
                 height = imageProxy.height,
-                rotationDegrees = imageProxy.imageInfo.rotationDegrees,
+                rotationDegrees = (imageProxy.imageInfo.rotationDegrees + config.frameRotationDegrees) % 360,
             )
-            scope.launch {
-                frameFlow.emit(frame)
+            latestFrame = frame
+            captureWaiter?.takeIf { !it.isCompleted }?.complete(frame)
+            captureWaiter = null
+            if (frameConfig.enabled && now - lastFrameAtMs >= frameConfig.minIntervalMillis) {
+                lastFrameAtMs = now
+                scope.launch {
+                    frameFlow.emit(frame)
+                }
             }
         } catch (throwable: Throwable) {
             scope.launch {
@@ -369,6 +331,22 @@ class CameraXCameraDriver(
             }
         } finally {
             imageProxy.close()
+        }
+    }
+
+    private suspend fun awaitSnapshotFrame(): CameraFrame {
+        val waiter = CompletableDeferred<CameraFrame>()
+        captureWaiter = waiter
+        return try {
+            withTimeout(SNAPSHOT_FRAME_TIMEOUT_MILLIS) {
+                waiter.await()
+            }
+        } catch (exception: TimeoutCancellationException) {
+            throw CameraException.CaptureFailureException("Timed out waiting for a CameraX snapshot frame.", exception)
+        } finally {
+            if (captureWaiter === waiter) {
+                captureWaiter = null
+            }
         }
     }
 
@@ -437,25 +415,29 @@ class CameraXCameraDriver(
 
         val provider = getOrCreateCameraProvider()
         val selector = selectCameraSelector(provider)
-        val shouldAnalyze = config.frameDeliveryConfig.enabled
+        val analysisSize = config.captureSize?.let { Size(it.width, it.height) }
+            ?: DEFAULT_CAPTURE_SIZE
+        val resolutionSelector = ResolutionSelector.Builder()
+            .setAspectRatioStrategy(AspectRatioStrategy.RATIO_16_9_FALLBACK_AUTO_STRATEGY)
+            .setResolutionStrategy(
+                ResolutionStrategy(
+                    analysisSize,
+                    ResolutionStrategy.FALLBACK_RULE_CLOSEST_LOWER_THEN_HIGHER,
+                )
+            )
+            .build()
 
         preview = Preview.Builder().build().also {
             it.surfaceProvider = hostView.surfaceProvider
         }
-        imageCapture = ImageCapture.Builder()
-            .setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY)
-            .build()
         imageAnalysis = ImageAnalysis.Builder()
+            .setResolutionSelector(resolutionSelector)
             .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
             .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_YUV_420_888)
             .build()
             .also { analysis ->
-                if (shouldAnalyze) {
-                    analysis.setAnalyzer(cameraExecutor) { imageProxy ->
-                        handleAnalysisFrame(imageProxy, config.frameDeliveryConfig)
-                    }
-                } else {
-                    analysis.clearAnalyzer()
+                analysis.setAnalyzer(cameraExecutor) { imageProxy ->
+                    handleAnalysisFrame(imageProxy, config.frameDeliveryConfig)
                 }
             }
 
@@ -464,7 +446,6 @@ class CameraXCameraDriver(
             lifecycleOwner,
             selector,
             preview,
-            imageCapture,
             imageAnalysis,
         )
         activeCameraId = camera?.cameraInfo?.let(::cameraIdOf)
@@ -637,15 +618,6 @@ class CameraXCameraDriver(
     private fun createOutputFile(prefix: String): File {
         val parent = File(appContext.cacheDir, "camera-sdk").apply { mkdirs() }
         return File(parent, "${prefix}_${System.currentTimeMillis()}.jpg")
-    }
-
-    private fun saveBitmap(bitmap: Bitmap, file: File) {
-        file.parentFile?.mkdirs()
-        FileOutputStream(file).use { output ->
-            if (!bitmap.compress(Bitmap.CompressFormat.JPEG, 95, output)) {
-                throw CameraException.CaptureFailureException("Failed to compress CameraX preview bitmap.")
-            }
-        }
     }
 
     private suspend fun <T> ListenableFuture<T>.await(): T {

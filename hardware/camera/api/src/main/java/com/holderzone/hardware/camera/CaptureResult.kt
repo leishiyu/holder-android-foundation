@@ -11,9 +11,8 @@ data class CaptureResult(
 )
 
 /**
- * Distinguishes real still capture from preview snapshots.
+ * Distinguishes the saved capture output kind.
  */
 enum class CaptureKind {
-    STILL,
     SNAPSHOT,
 }

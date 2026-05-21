@@ -3,18 +3,13 @@ package com.holderzone.hardware.camera.driver.camera2
 import android.Manifest
 import android.content.Context
 import android.content.pm.PackageManager
-import android.graphics.Bitmap
 import android.graphics.ImageFormat
-import android.graphics.Rect
 import android.graphics.SurfaceTexture
-import android.graphics.YuvImage
 import android.hardware.camera2.CameraCaptureSession
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraDevice
 import android.hardware.camera2.CameraManager
-import android.hardware.camera2.CameraMetadata
 import android.hardware.camera2.CaptureRequest
-import android.hardware.camera2.params.StreamConfigurationMap
 import android.media.Image
 import android.media.ImageReader
 import android.os.Handler
@@ -36,33 +31,39 @@ import com.holderzone.hardware.camera.CaptureResult
 import com.holderzone.hardware.camera.FrameDeliveryConfig
 import com.holderzone.hardware.camera.LensFacing
 import com.holderzone.hardware.camera.PreviewHost
+import com.holderzone.hardware.camera.internal.saveAsJpeg
 import com.holderzone.hardware.camera.internal.log.CameraLogger
 import com.holderzone.hardware.camera.internal.spi.CameraDriver
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
-import java.io.ByteArrayOutputStream
+import kotlinx.coroutines.withTimeout
 import java.io.File
-import java.io.FileOutputStream
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 
 /**
  * Camera2 fallback driver.
  *
- * It only exposes preview snapshot capture in the first SDK version.
+ * It exposes snapshot capture from the camera frame pipeline.
  */
 class Camera2CameraDriver(
     private val appContext: Context,
     private val logger: CameraLogger,
 ) : CameraDriver {
+
+    private companion object {
+        val DEFAULT_CAPTURE_SIZE = Size(1280, 720)
+        const val SNAPSHOT_FRAME_TIMEOUT_MILLIS = 2_000L
+    }
 
     private val cameraManager = appContext.getSystemService(Context.CAMERA_SERVICE) as CameraManager
     private val eventFlow = MutableSharedFlow<CameraEvent>(extraBufferCapacity = 16)
@@ -73,8 +74,7 @@ class Camera2CameraDriver(
     override val capabilities: CameraCapability = CameraCapability(
         switchLens = cameraManager.cameraIdList.size > 1,
         switchCamera = cameraManager.cameraIdList.size > 1,
-        stillCapture = false,
-        previewSnapshot = true,
+        snapshotCapture = true,
         frameStreaming = true,
         uvcSelection = false,
     )
@@ -211,23 +211,13 @@ class Camera2CameraDriver(
 
     override suspend fun capture(request: SdkCaptureRequest): CaptureResult {
         ensureOpen()
-        if (request is SdkCaptureRequest.RequireStill) {
-            throw CameraException.CaptureFailureException(
-                "Camera2 fallback only supports preview snapshots in SDK v1."
-            )
-        }
-
         val file = resolveOutputFile(
             requestedFile = request.outputFile,
             prefix = "camera2_snapshot",
         )
-        val bitmap = textureView?.bitmap
-        if (bitmap != null) {
-            saveBitmap(bitmap, file)
-        } else {
-            val frame = latestFrame ?: awaitSnapshotFrame()
-            saveNv21(frame, file)
-        }
+        val config = currentConfig ?: CameraConfig()
+        val frame = latestFrame ?: awaitSnapshotFrame()
+        frame.saveAsJpeg(file, config.jpegQuality, frame.rotationDegrees)
         return CaptureResult(
             path = file.absolutePath,
             kind = CaptureKind.SNAPSHOT,
@@ -268,11 +258,12 @@ class Camera2CameraDriver(
         frameConfig: FrameDeliveryConfig,
     ) {
         try {
+            val config = currentConfig ?: CameraConfig()
             val frame = CameraFrame(
                 nv21 = image.toNv21(),
                 width = image.width,
                 height = image.height,
-                rotationDegrees = 0,
+                rotationDegrees = config.frameRotationDegrees,
             )
             latestFrame = frame
             captureWaiter?.takeIf { !it.isCompleted }?.complete(frame)
@@ -304,7 +295,17 @@ class Camera2CameraDriver(
     private suspend fun awaitSnapshotFrame(): CameraFrame {
         val waiter = CompletableDeferred<CameraFrame>()
         captureWaiter = waiter
-        return waiter.await()
+        return try {
+            withTimeout(SNAPSHOT_FRAME_TIMEOUT_MILLIS) {
+                waiter.await()
+            }
+        } catch (exception: TimeoutCancellationException) {
+            throw CameraException.CaptureFailureException("Timed out waiting for a Camera2 snapshot frame.", exception)
+        } finally {
+            if (captureWaiter === waiter) {
+                captureWaiter = null
+            }
+        }
     }
 
     private fun ensureBackgroundThread() {
@@ -445,13 +446,32 @@ class Camera2CameraDriver(
     private fun choosePreviewSize(characteristics: CameraCharacteristics): Size {
         val map = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
             ?: throw CameraException.PreviewBindingException("Camera2 stream configuration is unavailable.")
-        return chooseSize(map.getOutputSizes(SurfaceTexture::class.java))
+        val targetSize = currentConfig?.captureSize?.let { Size(it.width, it.height) }
+            ?: DEFAULT_CAPTURE_SIZE
+        val textureSizes = map.getOutputSizes(SurfaceTexture::class.java).toSet()
+        val imageSizes = map.getOutputSizes(ImageFormat.YUV_420_888).toSet()
+        val sharedSizes = textureSizes.intersect(imageSizes).toTypedArray()
+        return chooseSize(
+            candidates = sharedSizes.takeIf { it.isNotEmpty() }
+                ?: map.getOutputSizes(SurfaceTexture::class.java),
+            targetSize = targetSize,
+        )
     }
 
-    private fun chooseSize(candidates: Array<Size>): Size {
+    private fun chooseSize(
+        candidates: Array<Size>,
+        targetSize: Size,
+    ): Size {
+        val targetPixels = targetSize.width * targetSize.height
+        val targetAspectRatio = targetSize.width.toFloat() / targetSize.height.toFloat()
         return candidates
-            .sortedByDescending { it.width * it.height }
-            .firstOrNull { it.width <= 1280 && it.height <= 720 }
+            .sortedWith(
+                compareBy<Size>(
+                    { kotlin.math.abs(it.width.toFloat() / it.height.toFloat() - targetAspectRatio) },
+                    { kotlin.math.abs(it.width * it.height - targetPixels) },
+                )
+            )
+            .firstOrNull()
             ?: candidates.first()
     }
 
@@ -487,26 +507,6 @@ class Camera2CameraDriver(
         return File(parent, "${prefix}_${System.currentTimeMillis()}.jpg")
     }
 
-    private fun saveBitmap(bitmap: Bitmap, file: File) {
-        file.parentFile?.mkdirs()
-        FileOutputStream(file).use { output ->
-            if (!bitmap.compress(Bitmap.CompressFormat.JPEG, 95, output)) {
-                throw CameraException.CaptureFailureException("Failed to compress Camera2 preview bitmap.")
-            }
-        }
-    }
-
-    private fun saveNv21(frame: CameraFrame, file: File) {
-        val yuv = YuvImage(frame.nv21, ImageFormat.NV21, frame.width, frame.height, null)
-        val output = ByteArrayOutputStream()
-        if (!yuv.compressToJpeg(Rect(0, 0, frame.width, frame.height), 95, output)) {
-            throw CameraException.CaptureFailureException("Failed to encode Camera2 snapshot from NV21.")
-        }
-        file.parentFile?.mkdirs()
-        FileOutputStream(file).use { stream ->
-            stream.write(output.toByteArray())
-        }
-    }
 }
 
 private fun Int?.toLensFacing(): LensFacing? {

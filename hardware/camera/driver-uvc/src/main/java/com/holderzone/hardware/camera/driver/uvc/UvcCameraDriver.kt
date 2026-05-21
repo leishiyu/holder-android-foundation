@@ -1,10 +1,7 @@
 package com.holderzone.hardware.camera.driver.uvc
 
 import android.content.Context
-import android.graphics.ImageFormat
-import android.graphics.Rect
 import android.graphics.SurfaceTexture
-import android.graphics.YuvImage
 import android.hardware.usb.UsbDevice
 import android.hardware.usb.UsbManager
 import android.view.Surface
@@ -24,23 +21,26 @@ import com.holderzone.hardware.camera.LensFacing
 import com.holderzone.hardware.camera.PreviewHost
 import com.holderzone.hardware.camera.R
 import com.holderzone.hardware.camera.UsbDeviceSelector
+import com.holderzone.hardware.camera.UvcYuvLayout
+import com.holderzone.hardware.camera.internal.saveAsJpeg
 import com.holderzone.hardware.camera.internal.log.CameraLogger
 import com.holderzone.hardware.camera.internal.spi.CameraDriver
 import com.serenegiant.usb.DeviceFilter
+import com.serenegiant.usb.Size
 import com.serenegiant.usb.USBMonitor
 import com.serenegiant.usb.UVCCamera
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.launch
-import java.io.ByteArrayOutputStream
+import kotlinx.coroutines.withTimeout
 import java.io.File
-import java.io.FileOutputStream
 import java.nio.ByteBuffer
 
 /**
@@ -53,6 +53,11 @@ class UvcCameraDriver(
 
     private companion object {
         const val TAG = "UvcCameraDriver"
+        const val DEFAULT_WIDTH = 640
+        const val DEFAULT_HEIGHT = 360
+        const val SNAPSHOT_FRAME_TIMEOUT_MILLIS = 2_000L
+        const val AUTO_LAYOUT_MIN_SAMPLES = 3
+        const val AUTO_LAYOUT_MIN_CONFIDENCE = 18
     }
 
     private val usbManager = appContext.getSystemService(Context.USB_SERVICE) as UsbManager
@@ -61,8 +66,7 @@ class UvcCameraDriver(
     override val capabilities: CameraCapability = CameraCapability(
         switchLens = false,
         switchCamera = usbManager.deviceList.size > 1,
-        stillCapture = false,
-        previewSnapshot = true,
+        snapshotCapture = true,
         frameStreaming = true,
         uvcSelection = true,
     )
@@ -83,11 +87,14 @@ class UvcCameraDriver(
     private var selectedDevice: UsbDevice? = null
     private var pendingControlBlock: USBMonitor.UsbControlBlock? = null
     private var openCamera: UVCCamera? = null
-    private var previewWidth: Int = 1280
-    private var previewHeight: Int = 720
+    private var previewWidth: Int = DEFAULT_WIDTH
+    private var previewHeight: Int = DEFAULT_HEIGHT
     private var latestFrame: CameraFrame? = null
     private var captureWaiter: CompletableDeferred<CameraFrame>? = null
     private var startWaiter: CompletableDeferred<Unit>? = null
+    private var resolvedAutoYuvLayout: UvcYuvLayout? = null
+    private var autoLayoutSamples: Int = 0
+    private var autoLayoutScore: Int = 0
     private var lastFrameAtMs: Long = 0L
     @Volatile
     private var closed = false
@@ -169,18 +176,14 @@ class UvcCameraDriver(
 
     override suspend fun capture(request: CaptureRequest): CaptureResult {
         ensureOpen()
-        if (request is CaptureRequest.RequireStill) {
-            throw CameraException.CaptureFailureException(
-                "UVC backend only supports preview snapshots in SDK v1."
-            )
-        }
 
         val file = resolveOutputFile(
             requestedFile = request.outputFile,
             prefix = "uvc_snapshot",
         )
+        val config = currentConfig ?: CameraConfig()
         val frame = latestFrame ?: waitForFrame()
-        saveFrame(frame, file)
+        frame.saveAsJpeg(file, config.jpegQuality, frame.rotationDegrees)
         return CaptureResult(
             path = file.absolutePath,
             kind = CaptureKind.SNAPSHOT,
@@ -244,7 +247,17 @@ class UvcCameraDriver(
     private suspend fun waitForFrame(): CameraFrame {
         val waiter = CompletableDeferred<CameraFrame>()
         captureWaiter = waiter
-        return waiter.await()
+        return try {
+            withTimeout(SNAPSHOT_FRAME_TIMEOUT_MILLIS) {
+                waiter.await()
+            }
+        } catch (exception: TimeoutCancellationException) {
+            throw CameraException.CaptureFailureException("Timed out waiting for a UVC snapshot frame.", exception)
+        } finally {
+            if (captureWaiter === waiter) {
+                captureWaiter = null
+            }
+        }
     }
 
     private fun openCamera(controlBlock: USBMonitor.UsbControlBlock) {
@@ -294,25 +307,28 @@ class UvcCameraDriver(
     }
 
     private fun configurePreviewSize(camera: UVCCamera) {
-        try {
-            camera.setPreviewSize(1280, 720, UVCCamera.FRAME_FORMAT_MJPEG)
-            previewWidth = 1280
-            previewHeight = 720
-        } catch (_: Throwable) {
-            try {
-                camera.setPreviewSize(1280, 720, UVCCamera.FRAME_FORMAT_YUYV)
-                previewWidth = 1280
-                previewHeight = 720
-            } catch (_: Throwable) {
-                camera.setPreviewSize(
-                    UVCCamera.DEFAULT_PREVIEW_WIDTH,
-                    UVCCamera.DEFAULT_PREVIEW_HEIGHT,
-                    UVCCamera.DEFAULT_PREVIEW_MODE,
-                )
-                previewWidth = UVCCamera.DEFAULT_PREVIEW_WIDTH
-                previewHeight = UVCCamera.DEFAULT_PREVIEW_HEIGHT
+        val targetWidth = currentConfig?.captureSize?.width ?: DEFAULT_WIDTH
+        val targetHeight = currentConfig?.captureSize?.height ?: DEFAULT_HEIGHT
+        val candidates = camera.getSupportedSizeList()
+            .takeIf { it.isNotEmpty() }
+            ?: listOf(Size(0, 0, 0, targetWidth, targetHeight))
+        val orderedSizes = chooseSizes(candidates, targetWidth, targetHeight)
+        val formats = listOf(UVCCamera.FRAME_FORMAT_MJPEG, UVCCamera.FRAME_FORMAT_YUYV)
+        for (size in orderedSizes) {
+            for (format in formats) {
+                try {
+                    camera.setPreviewSize(size.width, size.height, format)
+                    previewWidth = size.width
+                    previewHeight = size.height
+                    return
+                } catch (_: Throwable) {
+                    // Try the next supported size/format pair.
+                }
             }
         }
+        throw CameraException.PreviewBindingException(
+            "Failed to configure a supported UVC preview size."
+        )
     }
 
     private fun handleFrame(
@@ -327,12 +343,18 @@ class UvcCameraDriver(
             val bytes = ByteArray(length)
             buffer.rewind()
             buffer.get(bytes)
-            val nv21 = nv12ToNv21(bytes)
+            val config = currentConfig ?: CameraConfig()
+            val nv21 = normalizeUvcFrame(
+                source = bytes,
+                layout = config.uvcFrameConfig.yuvLayout,
+                width = previewWidth,
+                height = previewHeight,
+            )
             val frame = CameraFrame(
                 nv21 = nv21,
                 width = previewWidth,
                 height = previewHeight,
-                rotationDegrees = 0,
+                rotationDegrees = config.frameRotationDegrees,
             )
             latestFrame = frame
             captureWaiter?.takeIf { !it.isCompleted }?.complete(frame)
@@ -376,18 +398,63 @@ class UvcCameraDriver(
             }
         }
         openCamera = null
+        resolvedAutoYuvLayout = null
+        autoLayoutSamples = 0
+        autoLayoutScore = 0
     }
 
-    private fun saveFrame(frame: CameraFrame, file: File) {
-        val output = ByteArrayOutputStream()
-        val image = YuvImage(frame.nv21, ImageFormat.NV21, frame.width, frame.height, null)
-        if (!image.compressToJpeg(Rect(0, 0, frame.width, frame.height), 95, output)) {
-            throw CameraException.CaptureFailureException("Failed to encode UVC snapshot from NV21.")
+    private fun normalizeUvcFrame(
+        source: ByteArray,
+        layout: UvcYuvLayout,
+        width: Int,
+        height: Int,
+    ): ByteArray {
+        return when (layout) {
+            UvcYuvLayout.NV12_TO_NV21 -> nv12ToNv21(source)
+            UvcYuvLayout.NV21_DIRECT -> source.copyOf()
+            UvcYuvLayout.AUTO -> {
+                val resolvedLayout = resolvedAutoYuvLayout
+                    ?: resolveAutoYuvLayout(source, width, height)
+                when (resolvedLayout) {
+                    UvcYuvLayout.NV21_DIRECT -> source.copyOf()
+                    UvcYuvLayout.AUTO,
+                    UvcYuvLayout.NV12_TO_NV21,
+                    -> nv12ToNv21(source)
+                }
+            }
         }
-        file.parentFile?.mkdirs()
-        FileOutputStream(file).use { stream ->
-            stream.write(output.toByteArray())
+    }
+
+    private fun resolveAutoYuvLayout(
+        source: ByteArray,
+        width: Int,
+        height: Int,
+    ): UvcYuvLayout {
+        val frameSize = width * height
+        if (source.size < frameSize * 3 / 2) {
+            resolvedAutoYuvLayout = UvcYuvLayout.NV12_TO_NV21
+            logger.warn(TAG, "UVC frame buffer is shorter than expected; falling back to NV12_TO_NV21.")
+            return UvcYuvLayout.NV12_TO_NV21
         }
+
+        val directScore = scoreUvLayout(source, width, height, directNv21 = true)
+        val swappedScore = scoreUvLayout(source, width, height, directNv21 = false)
+        autoLayoutSamples += 1
+        autoLayoutScore += directScore - swappedScore
+
+        val absoluteScore = kotlin.math.abs(autoLayoutScore)
+        if (autoLayoutSamples >= AUTO_LAYOUT_MIN_SAMPLES && absoluteScore >= AUTO_LAYOUT_MIN_CONFIDENCE) {
+            val resolved = if (autoLayoutScore > 0) {
+                UvcYuvLayout.NV21_DIRECT
+            } else {
+                UvcYuvLayout.NV12_TO_NV21
+            }
+            resolvedAutoYuvLayout = resolved
+            logger.debug(TAG, "Resolved UVC YUV layout as $resolved.")
+            return resolved
+        }
+
+        return UvcYuvLayout.NV12_TO_NV21
     }
 
     private fun createOutputFile(prefix: String): File {
@@ -544,6 +611,92 @@ private fun nv12ToNv21(source: ByteArray): ByteArray {
         index += 2
     }
     return output
+}
+
+private fun scoreUvLayout(
+    source: ByteArray,
+    width: Int,
+    height: Int,
+    directNv21: Boolean,
+): Int {
+    val frameSize = width * height
+    val chromaStart = frameSize
+    val chromaEnd = (frameSize + frameSize / 2).coerceAtMost(source.size)
+    if (chromaEnd - chromaStart < 2) {
+        return 0
+    }
+
+    val stepX = (width / 12).coerceAtLeast(2)
+    val stepY = (height / 12).coerceAtLeast(2)
+    var score = 0
+    var samples = 0
+    var row = 0
+    while (row < height) {
+        var col = 0
+        while (col < width) {
+            val yIndex = row * width + col
+            val uvRow = row / 2
+            val uvCol = (col / 2) * 2
+            val uvIndex = chromaStart + uvRow * width + uvCol
+            if (yIndex < frameSize && uvIndex + 1 < chromaEnd) {
+                val y = source[yIndex].toInt() and 0xff
+                val first = source[uvIndex].toInt() and 0xff
+                val second = source[uvIndex + 1].toInt() and 0xff
+                val v = if (directNv21) first else second
+                val u = if (directNv21) second else first
+                val r = (y + 1.402f * (v - 128)).toInt().coerceIn(0, 255)
+                val g = (y - 0.344136f * (u - 128) - 0.714136f * (v - 128)).toInt().coerceIn(0, 255)
+                val b = (y + 1.772f * (u - 128)).toInt().coerceIn(0, 255)
+                score += colorPlausibilityScore(r, g, b)
+                samples += 1
+            }
+            col += stepX
+        }
+        row += stepY
+    }
+    return if (samples == 0) 0 else score / samples
+}
+
+private fun colorPlausibilityScore(
+    r: Int,
+    g: Int,
+    b: Int,
+): Int {
+    val max = maxOf(r, g, b)
+    val min = minOf(r, g, b)
+    val clippedChannels = listOf(r, g, b).count { it <= 3 || it >= 252 }
+    var score = 0
+    score -= clippedChannels * 5
+    if (g > r + 70 && g > b + 70) {
+        score -= 8
+    }
+    if (b > r + 95 && r < 80) {
+        score -= 5
+    }
+    if (max - min <= 18) {
+        score += 3
+    }
+    if (r in 16..245 && g in 16..245 && b in 16..245) {
+        score += 2
+    }
+    return score
+}
+
+private fun chooseSizes(
+    candidates: List<Size>,
+    targetWidth: Int,
+    targetHeight: Int,
+): List<Size> {
+    val targetPixels = targetWidth * targetHeight
+    val targetAspectRatio = targetWidth.toFloat() / targetHeight.toFloat()
+    return candidates
+        .distinctBy { "${it.width}x${it.height}" }
+        .sortedWith(
+            compareBy<Size>(
+                { kotlin.math.abs(it.width.toFloat() / it.height.toFloat() - targetAspectRatio) },
+                { kotlin.math.abs(it.width * it.height - targetPixels) },
+            )
+        )
 }
 
 private fun UsbDevice.toAvailableCameraId(): String {
