@@ -12,6 +12,7 @@ hardware/camera
   compose         # CameraPreview(controller, modifier)
   driver-camerax  # 默认内置相机实现，基于输出帧保存 snapshot
   driver-camera2  # Camera2 fallback，基于 ImageReader 输出帧保存 snapshot
+  driver-camera1  # Camera1 compatibility fallback，基于 NV21 预览帧保存 snapshot
   driver-uvc      # UVC 驱动、USBMonitor、native so、device filter
   face-mlkit      # 可选人脸分析扩展
 ```
@@ -110,7 +111,7 @@ controller.switchToNextCamera()
 
 - `CaptureRequest.Snapshot`
   - 所有 backend 统一保存当前相机输出帧
-  - Camera2 使用 `ImageReader` 帧，UVC 使用 frame callback 帧，CameraX 使用 `ImageAnalysis` 帧
+  - Camera2 使用 `ImageReader` 帧，Camera1/UVC 使用 frame callback 帧，CameraX 使用 `ImageAnalysis` 帧
   - 不再暴露 still capture / view bitmap 截图语义
 - `queryAvailableCameras()`
   - 返回当前 backend 可选相机列表
@@ -123,7 +124,7 @@ controller.switchToNextCamera()
 ## 图像质量与方向
 
 - `CameraConfig.captureSize`
-  - 为空时使用低端机友好的默认尺寸：CameraX/Camera2 为 `1280x720`，UVC 为 `640x360`
+  - 为空时使用低端机友好的默认尺寸：CameraX/Camera2/Camera1 为 `1280x720`，UVC 为 `640x360`
   - 传入 `CameraSize(width, height)` 时，各 backend 会选择最接近的设备支持尺寸
 - `CameraConfig.jpegQuality`
   - 控制 snapshot JPEG 压缩质量，范围 `1..100`，默认 `95`
@@ -148,6 +149,7 @@ controller.switchToNextCamera()
 
 - 内置相机默认优先 `CameraX`
 - `CameraX` 不可用时回退 `Camera2`
+- `Camera2` 不可用时最终回退 `Camera1`
 - `UVC` 不参与内置相机自动兜底，只会在显式指定 `backendPreference = UVC` 时启用
 
 ## 权限与清单

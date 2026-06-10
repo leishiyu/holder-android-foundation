@@ -4,6 +4,7 @@ import android.content.Context
 import android.view.View
 import com.holderzone.hardware.camera.AvailableCamera
 import com.holderzone.hardware.camera.CameraBackend
+import com.holderzone.hardware.camera.CameraBackendPreference
 import com.holderzone.hardware.camera.CameraCapability
 import com.holderzone.hardware.camera.CameraConfig
 import com.holderzone.hardware.camera.CameraEvent
@@ -137,12 +138,88 @@ class DefaultCameraControllerTest {
         advanceUntilIdle()
     }
 
+    @Test
+    fun autoBackend_fallsBackToCamera1AfterCameraXAndCamera2() = runTest(dispatcher) {
+        val camera1Driver = FakeDriver(backend = CameraBackend.CAMERA_1)
+        val context = newContext()
+        val factories = listOf(
+            FakeDriverFactory(
+                driver = FakeDriver(backend = CameraBackend.CAMERA_X),
+                backend = CameraBackend.CAMERA_X,
+                supported = false,
+            ),
+            FakeDriverFactory(
+                driver = FakeDriver(backend = CameraBackend.CAMERA_2),
+                backend = CameraBackend.CAMERA_2,
+                supported = false,
+            ),
+            FakeDriverFactory(
+                driver = camera1Driver,
+                backend = CameraBackend.CAMERA_1,
+            ),
+        )
+        val controller = DefaultCameraController(
+            context = context,
+            config = CameraConfig(),
+            driverFactories = factories,
+            logger = NoopCameraLogger,
+        )
+
+        controller.bind(FakePreviewHost(context))
+        advanceUntilIdle()
+
+        assertEquals(CameraBackend.CAMERA_1, (controller.state.value as CameraState.Bound).backend)
+        assertEquals(1, factories[0].supportCheckCount)
+        assertEquals(1, factories[1].supportCheckCount)
+        assertEquals(1, factories[2].supportCheckCount)
+        assertEquals(1, camera1Driver.bindCount)
+        controller.close()
+        advanceUntilIdle()
+    }
+
+    @Test
+    fun explicitCamera1Backend_usesOnlyCamera1Factory() = runTest(dispatcher) {
+        val camera1Driver = FakeDriver(backend = CameraBackend.CAMERA_1)
+        val context = newContext()
+        val factories = listOf(
+            FakeDriverFactory(
+                driver = FakeDriver(backend = CameraBackend.CAMERA_X),
+                backend = CameraBackend.CAMERA_X,
+            ),
+            FakeDriverFactory(
+                driver = camera1Driver,
+                backend = CameraBackend.CAMERA_1,
+            ),
+        )
+        val controller = DefaultCameraController(
+            context = context,
+            config = CameraConfig(backendPreference = CameraBackendPreference.CAMERA_1),
+            driverFactories = factories,
+            logger = NoopCameraLogger,
+        )
+
+        controller.bind(FakePreviewHost(context))
+        advanceUntilIdle()
+
+        assertEquals(CameraBackend.CAMERA_1, (controller.state.value as CameraState.Bound).backend)
+        assertEquals(0, factories[0].supportCheckCount)
+        assertEquals(1, factories[1].supportCheckCount)
+        assertEquals(1, camera1Driver.bindCount)
+        controller.close()
+        advanceUntilIdle()
+    }
+
     private class FakeDriverFactory(
         private val driver: FakeDriver,
+        override val backend: CameraBackend = CameraBackend.CAMERA_X,
+        private val supported: Boolean = true,
     ) : CameraDriverFactory {
-        override val backend: CameraBackend = CameraBackend.CAMERA_X
+        var supportCheckCount = 0
 
-        override suspend fun isSupported(appContext: Context, config: CameraConfig): Boolean = true
+        override suspend fun isSupported(appContext: Context, config: CameraConfig): Boolean {
+            supportCheckCount += 1
+            return supported
+        }
 
         override fun create(
             appContext: Context,
@@ -150,8 +227,9 @@ class DefaultCameraControllerTest {
         ): CameraDriver = driver
     }
 
-    private class FakeDriver : CameraDriver {
-        override val backend: CameraBackend = CameraBackend.CAMERA_X
+    private class FakeDriver(
+        override val backend: CameraBackend = CameraBackend.CAMERA_X,
+    ) : CameraDriver {
         override val capabilities: CameraCapability = CameraCapability(
             switchLens = true,
             switchCamera = true,

@@ -41,6 +41,7 @@ holder-android-foundation
 - `:hardware:camera:compose`
 - `:hardware:camera:driver-camerax`
 - `:hardware:camera:driver-camera2`
+- `:hardware:camera:driver-camera1`
 - `:hardware:camera:driver-uvc`
 - `:hardware:camera:face-mlkit`
 - `:hardware:scale`
@@ -90,6 +91,7 @@ holder-android-foundation
 - `view`
 - `driver-camerax`
 - `driver-camera2`
+- `driver-camera1`
 - `driver-uvc`
 
 #### `:hardware:cabinet`

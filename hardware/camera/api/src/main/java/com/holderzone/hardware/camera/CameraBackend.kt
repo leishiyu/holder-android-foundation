@@ -6,5 +6,6 @@ package com.holderzone.hardware.camera
 enum class CameraBackend {
     CAMERA_X,
     CAMERA_2,
+    CAMERA_1,
     UVC,
 }

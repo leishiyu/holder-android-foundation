@@ -7,5 +7,6 @@ enum class CameraBackendPreference {
     AUTO,
     CAMERA_X,
     CAMERA_2,
+    CAMERA_1,
     UVC,
 }

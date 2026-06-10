@@ -5,6 +5,7 @@ package com.holderzone.hardware.camera
  *
  * The [id] is backend-scoped:
  * - CameraX / Camera2 use the underlying camera id.
+ * - Camera1 uses the legacy camera index as a string.
  * - UVC uses a synthetic USB device key.
  */
 data class AvailableCamera(

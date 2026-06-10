@@ -196,6 +196,9 @@ class CameraXCameraDriver(
         imageAnalysis = null
         camera = null
         activeCameraId = null
+        if (selectedCameraId?.let(::lensFacingOfCameraId) != currentLensFacing) {
+            selectedCameraId = null
+        }
         latestFrame = null
         captureWaiter?.cancel()
         captureWaiter = null
@@ -602,6 +605,14 @@ class CameraXCameraDriver(
         return Camera2CameraInfo.from(cameraInfo)
             .getCameraCharacteristic(CameraCharacteristics.LENS_FACING)
             .toLensFacing()
+    }
+
+    private fun lensFacingOfCameraId(cameraId: String): LensFacing? {
+        return runCatching {
+            cameraManager.getCameraCharacteristics(cameraId)
+                .get(CameraCharacteristics.LENS_FACING)
+                .toLensFacing()
+        }.getOrNull()
     }
 
     private fun resolveOutputFile(

@@ -26,6 +26,7 @@ android {
                     "view/src/main/java",
                     "driver-camerax/src/main/java",
                     "driver-camera2/src/main/java",
+                    "driver-camera1/src/main/java",
                     "driver-uvc/src/main/java",
                 )
             )

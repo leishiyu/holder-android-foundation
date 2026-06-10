@@ -221,9 +221,14 @@ class DefaultCameraController(
 
     private suspend fun resolveFactory(): CameraDriverFactory {
         val orderedBackends = when (config.backendPreference) {
-            CameraBackendPreference.AUTO -> listOf(CameraBackend.CAMERA_X, CameraBackend.CAMERA_2)
+            CameraBackendPreference.AUTO -> listOf(
+                CameraBackend.CAMERA_X,
+                CameraBackend.CAMERA_2,
+                CameraBackend.CAMERA_1,
+            )
             CameraBackendPreference.CAMERA_X -> listOf(CameraBackend.CAMERA_X)
             CameraBackendPreference.CAMERA_2 -> listOf(CameraBackend.CAMERA_2)
+            CameraBackendPreference.CAMERA_1 -> listOf(CameraBackend.CAMERA_1)
             CameraBackendPreference.UVC -> listOf(CameraBackend.UVC)
         }
         val factoryMap = driverFactories.associateBy { it.backend }

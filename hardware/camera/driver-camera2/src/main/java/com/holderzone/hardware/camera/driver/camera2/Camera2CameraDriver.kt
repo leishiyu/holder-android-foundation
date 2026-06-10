@@ -167,6 +167,9 @@ class Camera2CameraDriver(
         imageReader = null
         activeCameraId = null
         activePreviewSize = null
+        if (selectedCameraId?.let(::lensFacingOf) != currentLensFacing) {
+            selectedCameraId = null
+        }
         eventFlow.emit(CameraEvent.PreviewStopped(backend))
     }
 
@@ -441,6 +444,14 @@ class Camera2CameraDriver(
             cameraManager.getCameraCharacteristics(id)
                 .get(CameraCharacteristics.LENS_FACING) == facing
         }
+    }
+
+    private fun lensFacingOf(cameraId: String): LensFacing? {
+        return runCatching {
+            cameraManager.getCameraCharacteristics(cameraId)
+                .get(CameraCharacteristics.LENS_FACING)
+                .toLensFacing()
+        }.getOrNull()
     }
 
     private fun choosePreviewSize(characteristics: CameraCharacteristics): Size {

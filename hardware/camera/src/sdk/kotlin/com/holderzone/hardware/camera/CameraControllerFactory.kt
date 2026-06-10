@@ -3,6 +3,7 @@ package com.holderzone.hardware.camera
 import android.content.Context
 import com.holderzone.hardware.camera.core.AndroidCameraLogger
 import com.holderzone.hardware.camera.core.DefaultCameraController
+import com.holderzone.hardware.camera.driver.camera1.Camera1DriverFactory
 import com.holderzone.hardware.camera.driver.camera2.Camera2DriverFactory
 import com.holderzone.hardware.camera.driver.camerax.CameraXDriverFactory
 import com.holderzone.hardware.camera.driver.uvc.UvcDriverFactory
@@ -29,6 +30,7 @@ object CameraControllerFactory {
             driverFactories = listOf(
                 CameraXDriverFactory(),
                 Camera2DriverFactory(),
+                Camera1DriverFactory(),
                 UvcDriverFactory(),
             ),
             logger = AndroidCameraLogger(enabled = config.enableLogging),
