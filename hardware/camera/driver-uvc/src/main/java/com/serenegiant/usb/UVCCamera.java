@@ -445,7 +445,7 @@ public class UVCCamera {
 		}
 		// Stop the native capture thread before clearing the callback to avoid
 		// racing a frame dispatch that is still in progress.
-		setFrameCallback(null, 0);
+//		setFrameCallback(null, 0);
 	}
 
 	/**
