@@ -96,6 +96,7 @@ class UvcCameraDriver(
     private var autoLayoutSamples: Int = 0
     private var autoLayoutScore: Int = 0
     private var lastFrameAtMs: Long = 0L
+    private val cameraReleaseLock = Any()
     @Volatile
     private var closed = false
 
@@ -382,25 +383,22 @@ class UvcCameraDriver(
     }
 
     private fun releaseCamera() {
-        pendingControlBlock = null
-        openCamera?.let { camera ->
-            runCatching {
-                camera.setFrameCallback(null, 0)
-            }
-            runCatching {
-                camera.stopPreview()
-            }
-            runCatching {
-                camera.close()
-            }
+        val cameraToRelease = synchronized(cameraReleaseLock) {
+            pendingControlBlock = null
+            val camera = openCamera
+            openCamera = null
+            resolvedAutoYuvLayout = null
+            autoLayoutSamples = 0
+            autoLayoutScore = 0
+            camera
+        }
+        cameraToRelease?.let { camera ->
             runCatching {
                 camera.destroy()
+            }.onFailure { throwable ->
+                logger.error(TAG, "Failed to release UVC camera.", throwable)
             }
         }
-        openCamera = null
-        resolvedAutoYuvLayout = null
-        autoLayoutSamples = 0
-        autoLayoutScore = 0
     }
 
     private fun normalizeUvcFrame(

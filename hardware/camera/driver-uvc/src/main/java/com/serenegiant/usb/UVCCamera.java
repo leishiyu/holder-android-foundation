@@ -440,10 +440,12 @@ public class UVCCamera {
 	 * stop preview
 	 */
 	public synchronized void stopPreview() {
-		setFrameCallback(null, 0);
 		if (mCtrlBlock != null) {
 			nativeStopPreview(mNativePtr);
 		}
+		// Stop the native capture thread before clearing the callback to avoid
+		// racing a frame dispatch that is still in progress.
+		setFrameCallback(null, 0);
 	}
 
 	/**
