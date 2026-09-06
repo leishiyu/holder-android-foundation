@@ -4,6 +4,7 @@ import android.content.Context
 import com.holderzone.hardware.scale.core.DefaultScaleFacade
 import com.holderzone.hardware.scale.driver.jw.JwScaleDriverFactory
 import com.holderzone.hardware.scale.driver.ly.LyScaleDriverFactory
+import com.holderzone.hardware.scale.driver.sohe.SoheScaleDriverFactory
 
 /**
  * Scale SDK facade 工厂。
@@ -16,7 +17,7 @@ object ScaleFacadeFactory {
     /**
      * 创建一个新的 [ScaleFacade]。
      *
-     * 返回的新实例默认注册 JW 与 LY 两个驱动工厂，
+     * 返回的新实例默认注册 JW、LY 与 SOHE 三个驱动工厂，
      * 后续的自动探测和显式厂商选择都由 facade 内部状态机统一处理。
      */
     fun create(context: Context): ScaleFacade {
@@ -25,6 +26,7 @@ object ScaleFacadeFactory {
             driverFactories = listOf(
                 JwScaleDriverFactory(),
                 LyScaleDriverFactory(),
+                SoheScaleDriverFactory(),
             ),
         )
     }

@@ -22,6 +22,7 @@ object ScalePortCatalog {
         return when (vendor) {
             ScaleVendor.JW -> jwDefaultCandidates
             ScaleVendor.LY -> lyDefaultCandidates
+            ScaleVendor.SOHE -> soheDefaultCandidates
         }
     }
 
@@ -49,4 +50,12 @@ object ScalePortCatalog {
         ScalePortConfig("/dev/ttyS3", 9_600),
         ScalePortConfig("/dev/ttyS2", 9_600),
     )
+
+    /**
+     * 首衡暂不猜测现场串口路径。
+     *
+     * 首衡协议文档只描述了 TTL/RS232 和数据格式，没有给出设备在目标终端上的
+     * 固定串口路径。调用方应通过 `ScaleConfig.portOverride` 显式传入端口和波特率。
+     */
+    private val soheDefaultCandidates: List<ScalePortConfig> = emptyList()
 }

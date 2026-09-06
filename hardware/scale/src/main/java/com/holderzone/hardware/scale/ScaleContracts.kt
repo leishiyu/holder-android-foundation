@@ -6,6 +6,7 @@ package com.holderzone.hardware.scale
 enum class ScaleVendor {
     JW,
     LY,
+    SOHE,
 }
 
 /**

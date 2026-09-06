@@ -306,7 +306,7 @@ class DefaultScaleFacade(
     private fun orderedFactories(preference: ScaleVendorPreference): List<ScaleDriverFactory> {
         return when (preference) {
             is ScaleVendorPreference.Auto -> {
-                val order = listOf(ScaleVendor.JW, ScaleVendor.LY)
+                val order = listOf(ScaleVendor.JW, ScaleVendor.LY, ScaleVendor.SOHE)
                 order.mapNotNull { vendor -> driverFactories.firstOrNull { it.vendor == vendor } }
             }
 

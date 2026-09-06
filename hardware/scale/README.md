@@ -1,6 +1,6 @@
 # Scale SDK
 
-`hardware-scale` 是面向称重设备的统一 SDK。它对外暴露一个 `ScaleFacade`，用于抹平 JW 与亮悦两套称重实现差异，并以可独立打包的 AAR 形式交付。
+`hardware-scale` 是面向称重设备的统一 SDK。它对外暴露一个 `ScaleFacade`，用于抹平 JW、亮悦和首衡三套称重实现差异，并以可独立打包的 AAR 形式交付。
 
 ## 目标形态
 
@@ -19,6 +19,7 @@ hardware/scale
     core
     driver/jw
     driver/ly
+    driver/sohe
     internal
   src/main/AndroidManifest.xml
   libs/jw
@@ -34,6 +35,8 @@ hardware/scale
   JW 厂商 SDK 适配，同时收口 JW 厂商二进制
 - `driver/ly`
   亮悦串口协议适配
+- `driver/sohe`
+  首衡 13 字节 ASCII 串口协议适配
 - `libs/jw`
   当前 module 自己持有的 JW 厂商二进制
 - 共享串口底层二进制
@@ -96,14 +99,16 @@ interface ScaleFacade : Closeable {
 | --- | --- | --- | --- | --- |
 | `JW` | Yes | Yes | Yes | Yes |
 | `LY` | Yes | Yes | Yes | Yes |
+| `SOHE` | Yes | Yes | Yes | Yes |
 
 说明：
 
-- 自动探测顺序固定为 `JW -> LY`
+- 自动探测顺序固定为 `JW -> LY -> SOHE`
 - 自动探测会先按厂商顺序，再按该厂商内置串口候选表顺序尝试
 - 自动探测依赖在 `probeTimeoutMs` 内收到有效重量数据
 - 现场设备如果输出节奏慢，建议优先使用显式指定厂商
 - 如果现场机器做过特殊改线，可以通过 `portOverride` 手动覆盖默认串口
+- 首衡未预置默认串口候选，建议显式指定 `ScaleVendor.SOHE` 和 `portOverride`
 
 ## 自动探测与显式指定
 
@@ -145,6 +150,7 @@ facade.start(
 
 - `JW`：`/dev/ttyS8` -> `/dev/ttyS1` -> `/dev/ttyS2` -> `/dev/ttyS3`，默认波特率 `9600`
 - `LY`：`/dev/ttyS1` -> `/dev/ttyS3` -> `/dev/ttyS2`，默认波特率 `9600`
+- `SOHE`：无默认候选，请通过 `portOverride` 传入现场串口和波特率
 
 ## 读取、去皮、清零
 
@@ -173,6 +179,10 @@ facade.readings.collect { reading ->
 facade.tare()
 facade.zero()
 ```
+
+首衡第一版适配按协议默认的连续发送模式工作。`R` 主动读取、`S` 获取自定义皮重和
+`YARE` 设置自定义皮重暂未加入公共 API；首衡返回的 `t` 皮重帧会被驱动识别并记录，
+不会进入实时重量流。
 
 ## AAR 打包命令
 
