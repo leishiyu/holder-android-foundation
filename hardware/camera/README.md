@@ -99,6 +99,7 @@ val result = controller.capture(
 
 val cameras = controller.queryAvailableCameras()
 controller.switchToNextCamera()
+controller.setFrameRotationDegrees(90)
 ```
 
 对应的资源释放边界：
@@ -130,7 +131,9 @@ controller.switchToNextCamera()
   - 控制 snapshot JPEG 压缩质量，范围 `1..100`，默认 `95`
 - `CameraConfig.frameRotationDegrees`
   - 用于校准设备输出帧方向，可选 `0`、`90`、`180`、`270`
-  - 对外 `frames` 会携带校准后的旋转角；保存 snapshot 时会将该旋转实际应用到 JPEG 像素
+  - SDK 会在各 backend 的统一帧出口直接旋转 NV21 像素，90°/270° 时同步交换宽高
+  - 对外 `frames` 返回已经完成旋转的 NV21，`CameraFrame.rotationDegrees` 对 SDK 输出帧为 `0`
+  - snapshot 直接使用已经旋转的帧生成 JPEG，不需要调用方再次旋转
 - `CameraConfig.uvcFrameConfig`
   - 仅影响 UVC backend，用于处理不同 UVC 设备输出的 YUV420SP UV 顺序差异
   - 默认 `UvcYuvLayout.AUTO` 会在早期帧上启发式判断；置信度不足时回退到 `NV12_TO_NV21`

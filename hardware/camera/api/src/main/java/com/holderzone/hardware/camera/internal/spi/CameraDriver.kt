@@ -30,6 +30,8 @@ interface CameraDriver : AutoCloseable {
 
     suspend fun stop()
 
+    suspend fun setFrameRotationDegrees(degrees: Int)
+
     suspend fun switchLens(facing: LensFacing)
 
     suspend fun switchToNextCamera()

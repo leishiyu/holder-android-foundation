@@ -31,8 +31,10 @@ import com.holderzone.hardware.camera.CaptureResult
 import com.holderzone.hardware.camera.FrameDeliveryConfig
 import com.holderzone.hardware.camera.LensFacing
 import com.holderzone.hardware.camera.PreviewHost
+import com.holderzone.hardware.camera.internal.CameraPreviewRotation
 import com.holderzone.hardware.camera.internal.saveAsJpeg
 import com.holderzone.hardware.camera.internal.log.CameraLogger
+import com.holderzone.hardware.camera.internal.rotateNv21
 import com.holderzone.hardware.camera.internal.spi.CameraDriver
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
@@ -83,11 +85,13 @@ class Camera2CameraDriver(
 
     private var previewHost: PreviewHost? = null
     private var textureView: TextureView? = null
+    private var previewRotation: CameraPreviewRotation? = null
     private var backgroundThread: HandlerThread? = null
     private var backgroundHandler: Handler? = null
     private var cameraDevice: CameraDevice? = null
     private var captureSession: CameraCaptureSession? = null
     private var imageReader: ImageReader? = null
+    @Volatile
     private var currentConfig: CameraConfig? = null
     private var currentLensFacing: LensFacing = LensFacing.BACK
     private var selectedCameraId: String? = null
@@ -105,6 +109,9 @@ class Camera2CameraDriver(
         selectedCameraId = null
         previewHost = host
         textureView = TextureView(host.previewContext)
+        previewRotation = CameraPreviewRotation(textureView!!).also {
+            it.setRotationDegrees(config.frameRotationDegrees)
+        }
         host.attachPreview(textureView!!)
     }
 
@@ -173,6 +180,15 @@ class Camera2CameraDriver(
         eventFlow.emit(CameraEvent.PreviewStopped(backend))
     }
 
+    override suspend fun setFrameRotationDegrees(degrees: Int) {
+        ensureOpen()
+        val config = currentConfig ?: throw CameraException.ConfigurationException(
+            "Camera2 config is missing."
+        )
+        currentConfig = config.copy(frameRotationDegrees = degrees)
+        previewRotation?.setRotationDegrees(degrees)
+    }
+
     override suspend fun switchLens(facing: LensFacing) {
         if (!capabilities.switchLens) {
             throw CameraException.ConfigurationException("Camera2 backend does not support lens switching.")
@@ -220,7 +236,7 @@ class Camera2CameraDriver(
         )
         val config = currentConfig ?: CameraConfig()
         val frame = latestFrame ?: awaitSnapshotFrame()
-        frame.saveAsJpeg(file, config.jpegQuality, frame.rotationDegrees)
+        frame.saveAsJpeg(file, config.jpegQuality)
         return CaptureResult(
             path = file.absolutePath,
             kind = CaptureKind.SNAPSHOT,
@@ -248,8 +264,10 @@ class Camera2CameraDriver(
         previewHost?.let { host ->
             textureView?.let(host::detachPreview)
         }
+        previewRotation?.close()
         previewHost = null
         textureView = null
+        previewRotation = null
         latestFrame = null
         captureWaiter?.cancel()
         captureWaiter = null
@@ -262,11 +280,17 @@ class Camera2CameraDriver(
     ) {
         try {
             val config = currentConfig ?: CameraConfig()
-            val frame = CameraFrame(
+            val rotated = rotateNv21(
                 nv21 = image.toNv21(),
                 width = image.width,
                 height = image.height,
                 rotationDegrees = config.frameRotationDegrees,
+            )
+            val frame = CameraFrame(
+                nv21 = rotated.nv21,
+                width = rotated.width,
+                height = rotated.height,
+                rotationDegrees = 0,
             )
             latestFrame = frame
             captureWaiter?.takeIf { !it.isCompleted }?.complete(frame)

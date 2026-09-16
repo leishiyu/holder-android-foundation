@@ -40,8 +40,10 @@ import com.holderzone.hardware.camera.CaptureResult
 import com.holderzone.hardware.camera.FrameDeliveryConfig
 import com.holderzone.hardware.camera.LensFacing
 import com.holderzone.hardware.camera.PreviewHost
-import com.holderzone.hardware.camera.internal.saveAsJpeg
+import com.holderzone.hardware.camera.internal.CameraPreviewRotation
 import com.holderzone.hardware.camera.internal.log.CameraLogger
+import com.holderzone.hardware.camera.internal.rotateNv21
+import com.holderzone.hardware.camera.internal.saveAsJpeg
 import com.holderzone.hardware.camera.internal.spi.CameraDriver
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
@@ -102,10 +104,12 @@ class CameraXCameraDriver(
     private var previewHost: PreviewHost? = null
     private var previewContainerView: View? = null
     private var previewView: PreviewView? = null
+    private var previewRotation: CameraPreviewRotation? = null
     private var cameraProvider: ProcessCameraProvider? = null
     private var preview: Preview? = null
     private var imageAnalysis: ImageAnalysis? = null
     private var camera: Camera? = null
+    @Volatile
     private var currentConfig: CameraConfig? = null
     private var currentLensFacing: LensFacing = LensFacing.BACK
     private var selectedCameraId: String? = null
@@ -127,6 +131,9 @@ class CameraXCameraDriver(
             implementationMode = PreviewView.ImplementationMode.COMPATIBLE
         }
         previewView = view
+        previewRotation = CameraPreviewRotation(view).also {
+            it.setRotationDegrees(config.frameRotationDegrees)
+        }
         host.attachPreview(view)
     }
 
@@ -205,6 +212,15 @@ class CameraXCameraDriver(
         eventFlow.emit(CameraEvent.PreviewStopped(backend))
     }
 
+    override suspend fun setFrameRotationDegrees(degrees: Int) {
+        ensureOpen()
+        val config = currentConfig ?: throw CameraException.ConfigurationException(
+            "CameraX config is missing."
+        )
+        currentConfig = config.copy(frameRotationDegrees = degrees)
+        previewRotation?.setRotationDegrees(degrees)
+    }
+
     override suspend fun switchLens(facing: LensFacing) {
         currentLensFacing = facing
         selectedCameraId = null
@@ -250,7 +266,7 @@ class CameraXCameraDriver(
         )
         val config = currentConfig ?: CameraConfig()
         val frame = latestFrame ?: awaitSnapshotFrame()
-        frame.saveAsJpeg(file, config.jpegQuality, frame.rotationDegrees)
+        frame.saveAsJpeg(file, config.jpegQuality)
         return CaptureResult(
             path = file.absolutePath,
             kind = CaptureKind.SNAPSHOT,
@@ -268,9 +284,11 @@ class CameraXCameraDriver(
             previewHost?.let { host ->
                 previewView?.let(host::detachPreview)
             }
+            previewRotation?.close()
             previewHost = null
             previewContainerView = null
             previewView = null
+            previewRotation = null
             cameraProvider?.unbindAll()
             preview = null
             imageAnalysis = null
@@ -306,11 +324,17 @@ class CameraXCameraDriver(
         try {
             val now = System.currentTimeMillis()
             val config = currentConfig ?: CameraConfig()
-            val frame = CameraFrame(
+            val rotated = rotateNv21(
                 nv21 = imageProxy.toNv21(),
                 width = imageProxy.width,
                 height = imageProxy.height,
-                rotationDegrees = (imageProxy.imageInfo.rotationDegrees + config.frameRotationDegrees) % 360,
+                rotationDegrees = imageProxy.imageInfo.rotationDegrees + config.frameRotationDegrees,
+            )
+            val frame = CameraFrame(
+                nv21 = rotated.nv21,
+                width = rotated.width,
+                height = rotated.height,
+                rotationDegrees = 0,
             )
             latestFrame = frame
             captureWaiter?.takeIf { !it.isCompleted }?.complete(frame)

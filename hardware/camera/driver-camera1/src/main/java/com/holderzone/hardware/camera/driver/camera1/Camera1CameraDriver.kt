@@ -25,6 +25,7 @@ import com.holderzone.hardware.camera.FrameDeliveryConfig
 import com.holderzone.hardware.camera.LensFacing
 import com.holderzone.hardware.camera.PreviewHost
 import com.holderzone.hardware.camera.internal.log.CameraLogger
+import com.holderzone.hardware.camera.internal.rotateNv21
 import com.holderzone.hardware.camera.internal.saveAsJpeg
 import com.holderzone.hardware.camera.internal.spi.CameraDriver
 import kotlinx.coroutines.CompletableDeferred
@@ -85,6 +86,7 @@ class Camera1CameraDriver(
     private var previewHost: PreviewHost? = null
     private var surfaceView: SurfaceView? = null
     private var camera: Camera? = null
+    @Volatile
     private var currentConfig: CameraConfig? = null
     private var currentLensFacing: LensFacing = LensFacing.BACK
     private var selectedCameraId: Int? = null
@@ -145,6 +147,16 @@ class Camera1CameraDriver(
         stopInternal(emitEvent = true)
     }
 
+    override suspend fun setFrameRotationDegrees(degrees: Int) = operationMutex.withLock {
+        ensureOpen()
+        val config = currentConfig ?: throw CameraException.ConfigurationException(
+            "Camera1 config is missing."
+        )
+        currentConfig = config.copy(frameRotationDegrees = degrees)
+        camera?.setDisplayOrientation(degrees)
+        Unit
+    }
+
     override suspend fun switchLens(facing: LensFacing) = operationMutex.withLock {
         ensureOpen()
         if (!capabilities.switchLens) {
@@ -193,7 +205,7 @@ class Camera1CameraDriver(
         )
         val config = currentConfig ?: CameraConfig()
         val frame = latestFrame ?: awaitSnapshotFrame()
-        frame.saveAsJpeg(file, config.jpegQuality, frame.rotationDegrees)
+        frame.saveAsJpeg(file, config.jpegQuality)
         return CaptureResult(
             path = file.absolutePath,
             kind = CaptureKind.SNAPSHOT,
@@ -281,6 +293,7 @@ class Camera1CameraDriver(
             ?.let { parameters.focusMode = it }
         openedCamera.parameters = parameters
 
+        openedCamera.setDisplayOrientation(config.frameRotationDegrees)
         openedCamera.setPreviewDisplay(holder)
         val bufferSize = previewSize.width * previewSize.height * 3 / 2
         repeat(2) {
@@ -365,11 +378,17 @@ class Camera1CameraDriver(
                 return
             }
             val config = currentConfig ?: CameraConfig()
-            val frame = CameraFrame(
+            val rotated = rotateNv21(
                 nv21 = data.copyOf(),
                 width = previewSize.width,
                 height = previewSize.height,
                 rotationDegrees = config.frameRotationDegrees,
+            )
+            val frame = CameraFrame(
+                nv21 = rotated.nv21,
+                width = rotated.width,
+                height = rotated.height,
+                rotationDegrees = 0,
             )
             latestFrame = frame
             captureWaiter?.takeIf { !it.isCompleted }?.complete(frame)

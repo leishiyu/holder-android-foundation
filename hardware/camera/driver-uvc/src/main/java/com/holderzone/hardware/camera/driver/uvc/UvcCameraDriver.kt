@@ -22,8 +22,10 @@ import com.holderzone.hardware.camera.PreviewHost
 import com.holderzone.hardware.camera.R
 import com.holderzone.hardware.camera.UsbDeviceSelector
 import com.holderzone.hardware.camera.UvcYuvLayout
+import com.holderzone.hardware.camera.internal.CameraPreviewRotation
 import com.holderzone.hardware.camera.internal.saveAsJpeg
 import com.holderzone.hardware.camera.internal.log.CameraLogger
+import com.holderzone.hardware.camera.internal.rotateNv21
 import com.holderzone.hardware.camera.internal.spi.CameraDriver
 import com.serenegiant.usb.DeviceFilter
 import com.serenegiant.usb.Size
@@ -81,8 +83,10 @@ class UvcCameraDriver(
 
     private var previewHost: PreviewHost? = null
     private var textureView: TextureView? = null
+    private var previewRotation: CameraPreviewRotation? = null
     private var surface: Surface? = null
     private var usbMonitor: USBMonitor? = null
+    @Volatile
     private var currentConfig: CameraConfig? = null
     private var selectedDevice: UsbDevice? = null
     private var pendingControlBlock: USBMonitor.UsbControlBlock? = null
@@ -106,6 +110,9 @@ class UvcCameraDriver(
         previewHost = host
         textureView = TextureView(host.previewContext).apply {
             surfaceTextureListener = PreviewTextureListener()
+        }
+        previewRotation = CameraPreviewRotation(textureView!!).also {
+            it.setRotationDegrees(config.frameRotationDegrees)
         }
         host.attachPreview(textureView!!)
         ensureUsbMonitor()
@@ -140,6 +147,15 @@ class UvcCameraDriver(
         releaseCamera()
         usbMonitor?.takeIf { it.isRegistered }?.unregister()
         eventFlow.emit(CameraEvent.PreviewStopped(backend))
+    }
+
+    override suspend fun setFrameRotationDegrees(degrees: Int) {
+        ensureOpen()
+        val config = currentConfig ?: throw CameraException.ConfigurationException(
+            "UVC config is missing."
+        )
+        currentConfig = config.copy(frameRotationDegrees = degrees)
+        previewRotation?.setRotationDegrees(degrees)
     }
 
     override suspend fun switchLens(facing: LensFacing) {
@@ -184,7 +200,7 @@ class UvcCameraDriver(
         )
         val config = currentConfig ?: CameraConfig()
         val frame = latestFrame ?: waitForFrame()
-        frame.saveAsJpeg(file, config.jpegQuality, frame.rotationDegrees)
+        frame.saveAsJpeg(file, config.jpegQuality)
         return CaptureResult(
             path = file.absolutePath,
             kind = CaptureKind.SNAPSHOT,
@@ -206,8 +222,10 @@ class UvcCameraDriver(
         previewHost?.let { host ->
             textureView?.let(host::detachPreview)
         }
+        previewRotation?.close()
         previewHost = null
         textureView = null
+        previewRotation = null
         latestFrame = null
         captureWaiter?.cancel()
         startWaiter?.cancel()
@@ -351,11 +369,17 @@ class UvcCameraDriver(
                 width = previewWidth,
                 height = previewHeight,
             )
-            val frame = CameraFrame(
+            val rotated = rotateNv21(
                 nv21 = nv21,
                 width = previewWidth,
                 height = previewHeight,
                 rotationDegrees = config.frameRotationDegrees,
+            )
+            val frame = CameraFrame(
+                nv21 = rotated.nv21,
+                width = rotated.width,
+                height = rotated.height,
+                rotationDegrees = 0,
             )
             latestFrame = frame
             captureWaiter?.takeIf { !it.isCompleted }?.complete(frame)

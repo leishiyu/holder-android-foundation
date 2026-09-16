@@ -76,6 +76,8 @@ class DefaultCameraController(
                     is ControllerCommand.Bind -> command.finishUnit { handleBind(command.host) }
                     is ControllerCommand.Start -> command.finishUnit { handleStart() }
                     is ControllerCommand.Stop -> command.finishUnit { handleStop() }
+                    is ControllerCommand.SetFrameRotationDegrees ->
+                        command.finishUnit { handleSetFrameRotationDegrees(command.degrees) }
                     is ControllerCommand.SwitchLens -> command.finishUnit { handleSwitchLens(command.facing) }
                     is ControllerCommand.SwitchToNextCamera -> command.finishUnit { handleSwitchToNextCamera() }
                     is ControllerCommand.QueryAvailableCameras -> command.finishResult { handleQueryAvailableCameras() }
@@ -99,6 +101,10 @@ class DefaultCameraController(
 
     override suspend fun stop() {
         submit<Unit>(ControllerCommand.Stop())
+    }
+
+    override suspend fun setFrameRotationDegrees(degrees: Int) {
+        submit<Unit>(ControllerCommand.SetFrameRotationDegrees(degrees))
     }
 
     override suspend fun switchLens(facing: com.holderzone.hardware.camera.LensFacing) {
@@ -174,6 +180,15 @@ class DefaultCameraController(
         val driver = requireDriver()
         driver.stop()
         mutableState.value = CameraState.Stopped(driver.backend, driver.capabilities)
+    }
+
+    private suspend fun handleSetFrameRotationDegrees(degrees: Int) {
+        if (degrees !in CameraConfig.SUPPORTED_ROTATION_DEGREES) {
+            throw CameraException.ConfigurationException(
+                "frameRotationDegrees must be one of 0, 90, 180 or 270."
+            )
+        }
+        requireDriver().setFrameRotationDegrees(degrees)
     }
 
     private suspend fun handleSwitchLens(facing: com.holderzone.hardware.camera.LensFacing) {
@@ -372,6 +387,11 @@ class DefaultCameraController(
         ) : ControllerCommand
 
         class Stop(
+            override val completion: CompletableDeferred<Unit> = CompletableDeferred(),
+        ) : ControllerCommand
+
+        class SetFrameRotationDegrees(
+            val degrees: Int,
             override val completion: CompletableDeferred<Unit> = CompletableDeferred(),
         ) : ControllerCommand
 

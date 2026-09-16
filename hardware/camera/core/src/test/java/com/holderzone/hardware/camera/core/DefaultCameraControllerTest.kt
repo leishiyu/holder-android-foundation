@@ -101,6 +101,25 @@ class DefaultCameraControllerTest {
     }
 
     @Test
+    fun setFrameRotationDegrees_delegatesToDriver() = runTest(dispatcher) {
+        val driver = FakeDriver()
+        val context = newContext()
+        val controller = DefaultCameraController(
+            context = context,
+            config = CameraConfig(),
+            driverFactories = listOf(FakeDriverFactory(driver)),
+            logger = NoopCameraLogger,
+        )
+
+        controller.bind(FakePreviewHost(context))
+        controller.setFrameRotationDegrees(90)
+
+        assertEquals(90, driver.lastRotationDegrees)
+        controller.close()
+        advanceUntilIdle()
+    }
+
+    @Test
     fun queryAndSwitchToNextCamera_delegateToDriver() = runTest(dispatcher) {
         val driver = FakeDriver().apply {
             availableCameras = listOf(
@@ -245,6 +264,7 @@ class DefaultCameraControllerTest {
         var captureCount = 0
         var switchNextCameraCount = 0
         var queryCameraCount = 0
+        var lastRotationDegrees = 0
         var lastRequest: CaptureRequest? = null
         var availableCameras: List<AvailableCamera> = emptyList()
 
@@ -260,6 +280,10 @@ class DefaultCameraControllerTest {
         override suspend fun stop() {
             stopCount += 1
             events.emit(CameraEvent.PreviewStopped(backend))
+        }
+
+        override suspend fun setFrameRotationDegrees(degrees: Int) {
+            lastRotationDegrees = degrees
         }
 
         override suspend fun switchLens(facing: LensFacing) = Unit

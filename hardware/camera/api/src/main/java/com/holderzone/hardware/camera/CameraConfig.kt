@@ -33,8 +33,12 @@ data class CameraConfig(
         }
     }
 
-    private companion object {
-        val SUPPORTED_ROTATION_DEGREES = setOf(0, 90, 180, 270)
+    companion object {
+        /**
+         * Right-angle rotations accepted by the SDK frame pipeline.
+         */
+        @JvmField
+        val SUPPORTED_ROTATION_DEGREES: Set<Int> = setOf(0, 90, 180, 270)
     }
 }
 

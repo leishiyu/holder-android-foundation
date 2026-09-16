@@ -46,6 +46,14 @@ interface CameraController : AutoCloseable {
     suspend fun stop()
 
     /**
+     * Updates the rotation applied to future frame pixels and the active preview.
+     *
+     * The value must be one of [CameraConfig.SUPPORTED_ROTATION_DEGREES]. The change takes effect
+     * without recreating the controller or rebinding the preview host.
+     */
+    suspend fun setFrameRotationDegrees(degrees: Int)
+
+    /**
      * Switches the active lens when supported by the backend.
      */
     suspend fun switchLens(facing: LensFacing)
