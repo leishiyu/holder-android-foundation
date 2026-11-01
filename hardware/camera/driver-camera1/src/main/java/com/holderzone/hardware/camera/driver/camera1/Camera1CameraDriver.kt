@@ -28,13 +28,16 @@ import com.holderzone.hardware.camera.internal.log.CameraLogger
 import com.holderzone.hardware.camera.internal.rotateNv21
 import com.holderzone.hardware.camera.internal.saveAsJpeg
 import com.holderzone.hardware.camera.internal.spi.CameraDriver
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.asSharedFlow
@@ -45,6 +48,7 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import java.io.File
+import kotlin.coroutines.coroutineContext
 import kotlin.coroutines.resume
 
 /**
@@ -53,17 +57,32 @@ import kotlin.coroutines.resume
  * Camera1 is deprecated by Android, but remains useful as a fallback for older or vendor-custom
  * devices whose Camera2/CameraX metadata does not match the physical camera layout.
  */
-class Camera1CameraDriver(
+class Camera1CameraDriver internal constructor(
     private val appContext: Context,
     private val logger: CameraLogger,
+    private val cameraOpener: suspend (Int) -> Camera,
 ) : CameraDriver {
+
+    constructor(appContext: Context, logger: CameraLogger) : this(
+        appContext,
+        logger,
+        // Do not lose a newly opened camera to prompt cancellation when returning from IO.
+        { cameraId ->
+            // Keep the return-to-Main handoff non-cancellable too. Combining NonCancellable
+            // and IO in one withContext can still discard its result on the dispatcher hop.
+            withContext(NonCancellable) {
+                withContext(Dispatchers.IO) { Camera.open(cameraId) }
+            }
+        },
+    )
 
     private companion object {
         val DEFAULT_CAPTURE_SIZE = CameraSize.HD_720P
         const val SNAPSHOT_FRAME_TIMEOUT_MILLIS = 2_000L
+        const val FIRST_FRAME_TIMEOUT_MILLIS = 5_000L
         const val CAMERA_RELEASE_SETTLE_MILLIS = 200L
         const val SURFACE_READY_TIMEOUT_MILLIS = 5_000L
-        const val OPEN_RETRY_COUNT = 1
+        const val START_RETRY_COUNT = 1
     }
 
     override val backend: CameraBackend = CameraBackend.CAMERA_1
@@ -93,8 +112,12 @@ class Camera1CameraDriver(
     private var activeCameraId: Int? = null
     private var latestFrame: CameraFrame? = null
     private var captureWaiter: CompletableDeferred<CameraFrame>? = null
+    private var firstFrameWaiter: CompletableDeferred<CameraFrame>? = null
+    private var sessionFailure: CameraException? = null
     private var lastFrameAtMs: Long = 0L
     private var previewActive = false
+    // Unlike previewActive, this survives a failed switch so another switch can reopen the camera.
+    private var previewRequested = false
     private var closed = false
 
     override suspend fun bind(host: PreviewHost, config: CameraConfig) = operationMutex.withLock {
@@ -111,39 +134,17 @@ class Camera1CameraDriver(
 
     override suspend fun start() = operationMutex.withLock {
         ensureOpen()
-        ensurePermission()
+        previewRequested = true
         if (previewActive && camera != null) {
             return
         }
-
-        val view = surfaceView ?: throw CameraException.PreviewBindingException(
-            "Camera1 preview host is not bound."
-        )
-        val holder = awaitSurfaceHolder(view)
-        val cameraId = selectedCameraId ?: selectCameraId(currentLensFacing)
-        val config = currentConfig ?: CameraConfig()
-        val openedCamera = openCameraWithRetry(cameraId)
-        try {
-            ensureOpen()
-            withContext(Dispatchers.Main.immediate) {
-                ensureOpen()
-                configureAndStartCamera(
-                    openedCamera = openedCamera,
-                    holder = holder,
-                    cameraId = cameraId,
-                    config = config,
-                )
-            }
-        } catch (throwable: Throwable) {
-            releaseCamera(openedCamera)
-            delay(CAMERA_RELEASE_SETTLE_MILLIS)
-            throw throwable
-        }
-        eventFlow.emit(CameraEvent.PreviewStarted(backend))
+        stopInternal(emitEvent = false)
+        startInternal()
     }
 
     override suspend fun stop() = operationMutex.withLock {
         ensureOpen()
+        previewRequested = false
         stopInternal(emitEvent = true)
     }
 
@@ -153,7 +154,7 @@ class Camera1CameraDriver(
             "Camera1 config is missing."
         )
         currentConfig = config.copy(frameRotationDegrees = degrees)
-        camera?.setDisplayOrientation(degrees)
+        camera?.takeIf { sessionFailure == null }?.setDisplayOrientation(degrees)
         Unit
     }
 
@@ -164,9 +165,9 @@ class Camera1CameraDriver(
         }
         currentLensFacing = facing
         selectedCameraId = null
-        if (previewActive || camera != null) {
+        if (previewRequested) {
             stopInternal(emitEvent = true)
-            startInternalAfterSwitch()
+            startInternal()
         }
     }
 
@@ -186,9 +187,9 @@ class Camera1CameraDriver(
         val nextCamera = cameras[nextIndex]
         selectedCameraId = nextCamera.id.toIntOrNull()
         nextCamera.lensFacing?.let { currentLensFacing = it }
-        if (previewActive || camera != null) {
+        if (previewRequested) {
             stopInternal(emitEvent = true)
-            startInternalAfterSwitch()
+            startInternal()
         }
     }
 
@@ -199,6 +200,12 @@ class Camera1CameraDriver(
 
     override suspend fun capture(request: CaptureRequest): CaptureResult {
         ensureOpen()
+        if (!previewActive || camera == null || sessionFailure != null) {
+            throw CameraException.CaptureFailureException(
+                "Camera1 preview is not ready. Start or switch the camera before capturing.",
+                sessionFailure,
+            )
+        }
         val file = resolveOutputFile(
             requestedFile = request.outputFile,
             prefix = "camera1_snapshot",
@@ -218,68 +225,94 @@ class Camera1CameraDriver(
             return
         }
         closed = true
-
-        runCatching {
-            camera?.setPreviewCallbackWithBuffer(null)
-        }.onFailure {
-            logger.error("Camera1CameraDriver", "Failed to clear Camera1 preview callback.", it)
-        }
-        runCatching {
-            camera?.stopPreview()
-        }.onFailure {
-            logger.error("Camera1CameraDriver", "Failed to stop Camera1 preview.", it)
-        }
-        runCatching {
-            camera?.release()
-        }.onFailure {
-            logger.error("Camera1CameraDriver", "Failed to release Camera1.", it)
-        }
+        previewRequested = false
+        clearSession(CameraException.ClosedException())?.let(::releaseCamera)
 
         previewHost?.let { host ->
             surfaceView?.let(host::detachPreview)
         }
-        camera = null
         previewHost = null
         surfaceView = null
-        activeCameraId = null
         selectedCameraId = null
-        latestFrame = null
-        captureWaiter?.cancel()
-        captureWaiter = null
-        previewActive = false
         scope.cancel()
     }
 
-    private suspend fun startInternalAfterSwitch() {
+    private suspend fun startInternal() {
         ensurePermission()
         val view = surfaceView ?: throw CameraException.PreviewBindingException(
             "Camera1 preview host is not bound."
         )
-        val holder = awaitSurfaceHolder(view)
         val cameraId = selectedCameraId ?: selectCameraId(currentLensFacing)
-        val config = currentConfig ?: CameraConfig()
-        val openedCamera = openCameraWithRetry(cameraId)
-        try {
-            ensureOpen()
-            withContext(Dispatchers.Main.immediate) {
+        var lastFailure: Throwable? = null
+        repeat(START_RETRY_COUNT + 1) { attempt ->
+            var openedCamera: Camera? = null
+            var adopted = false
+            try {
                 ensureOpen()
-                configureAndStartCamera(openedCamera, holder, cameraId, config)
+                val holder = awaitSurfaceHolder(view)
+                logger.debug("Camera1CameraDriver", "Opening camera id=$cameraId attempt=${attempt + 1}")
+                openedCamera = cameraOpener(cameraId)
+                ensureOpen()
+                coroutineContext.ensureActive()
+                camera = openedCamera
+                adopted = true
+                sessionFailure = null
+                val waiter = CompletableDeferred<CameraFrame>()
+                firstFrameWaiter = waiter
+                configureAndStartCamera(
+                    openedCamera,
+                    holder,
+                    currentConfig ?: CameraConfig(),
+                    useCallbackBuffers = attempt == 0,
+                )
+                try {
+                    withTimeout(FIRST_FRAME_TIMEOUT_MILLIS) { waiter.await() }
+                } catch (exception: TimeoutCancellationException) {
+                    coroutineContext.ensureActive()
+                    throw CameraException.PreviewBindingException(
+                        "Camera1 camera id $cameraId produced no preview frame within ${FIRST_FRAME_TIMEOUT_MILLIS}ms.",
+                        exception,
+                    )
+                }
+                ensureOpen()
+                sessionFailure?.let { throw it }
+                selectedCameraId = cameraId
+                activeCameraId = cameraId
+                previewActive = true
+                firstFrameWaiter = null
+                logger.debug("Camera1CameraDriver", "First preview frame received for camera id=$cameraId")
+                eventFlow.emit(CameraEvent.PreviewStarted(backend))
+                return
+            } catch (throwable: Throwable) {
+                if (camera === openedCamera && openedCamera != null) {
+                    clearSession()?.let(::releaseCamera)
+                } else if (!adopted) {
+                    openedCamera?.let(::releaseCamera)
+                }
+                if (throwable is CancellationException || throwable is CameraException.ClosedException) {
+                    throw throwable
+                }
+                lastFailure = throwable
+                logger.error("Camera1CameraDriver", "Camera id=$cameraId start attempt=${attempt + 1} failed.", throwable)
+                if (attempt < START_RETRY_COUNT) {
+                    // Retry the entire preview pipeline, not only Camera.open(). Some vendor HALs
+                    // open successfully but fail to deliver buffered preview callbacks after a switch.
+                    delay(CAMERA_RELEASE_SETTLE_MILLIS * (attempt + 1))
+                }
             }
-        } catch (throwable: Throwable) {
-            releaseCamera(openedCamera)
-            delay(CAMERA_RELEASE_SETTLE_MILLIS)
-            throw throwable
         }
-        eventFlow.emit(CameraEvent.PreviewStarted(backend))
+        throw CameraException.PreviewBindingException(
+            "Camera1 preview failed for camera id $cameraId after ${START_RETRY_COUNT + 1} attempts.",
+            lastFailure,
+        )
     }
 
     private fun configureAndStartCamera(
         openedCamera: Camera,
         holder: SurfaceHolder,
-        cameraId: Int,
         config: CameraConfig,
+        useCallbackBuffers: Boolean,
     ) {
-        camera = openedCamera
         val parameters = openedCamera.parameters
         val previewSize = choosePreviewSize(
             sizes = parameters.supportedPreviewSizes,
@@ -293,30 +326,35 @@ class Camera1CameraDriver(
             ?.let { parameters.focusMode = it }
         openedCamera.parameters = parameters
 
+        // Vendor HALs can adjust the requested size. Allocate buffers for the effective parameters.
+        val actualParameters = openedCamera.parameters
+        val actualSize = actualParameters.previewSize
+        if (actualParameters.previewFormat != ImageFormat.NV21) {
+            throw CameraException.ConfigurationException("Camera1 did not accept NV21 preview format.")
+        }
+        logger.debug("Camera1CameraDriver", "Preview ${actualSize.width}x${actualSize.height}, buffered=$useCallbackBuffers")
+
         openedCamera.setDisplayOrientation(config.frameRotationDegrees)
         openedCamera.setPreviewDisplay(holder)
-        val bufferSize = previewSize.width * previewSize.height * 3 / 2
-        repeat(2) {
-            openedCamera.addCallbackBuffer(ByteArray(bufferSize))
+        openedCamera.setErrorCallback { code, source ->
+            failSession(source, CameraException.DeviceUnavailableException("Camera1 error $code for camera id ${activeCameraId ?: selectedCameraId}."))
         }
         val frameConfig = config.frameDeliveryConfig
-        openedCamera.setPreviewCallbackWithBuffer { data, source ->
-            handlePreviewFrame(data, source, frameConfig)
+        val callback = Camera.PreviewCallback { data, source ->
+            handlePreviewFrame(data, source, frameConfig, actualSize.width, actualSize.height, useCallbackBuffers)
+        }
+        if (useCallbackBuffers) {
+            openedCamera.setPreviewCallbackWithBuffer(callback)
+            val bufferSize = actualSize.width * actualSize.height * 3 / 2
+            repeat(2) { openedCamera.addCallbackBuffer(ByteArray(bufferSize)) }
+        } else {
+            openedCamera.setPreviewCallback(callback)
         }
         openedCamera.startPreview()
-        selectedCameraId = cameraId
-        activeCameraId = cameraId
-        previewActive = true
     }
 
     private suspend fun stopInternal(emitEvent: Boolean) {
-        val cameraToRelease = camera
-        camera = null
-        previewActive = false
-        activeCameraId = null
-        latestFrame = null
-        captureWaiter?.cancel()
-        captureWaiter = null
+        val cameraToRelease = clearSession()
 
         if (cameraToRelease != null) {
             releaseCamera(cameraToRelease)
@@ -327,29 +365,25 @@ class Camera1CameraDriver(
         }
     }
 
-    private suspend fun openCameraWithRetry(cameraId: Int): Camera {
-        var lastFailure: Throwable? = null
-        repeat(OPEN_RETRY_COUNT + 1) { attempt ->
-            try {
-                return withContext(Dispatchers.IO) {
-                    Camera.open(cameraId)
-                }
-            } catch (throwable: Throwable) {
-                lastFailure = throwable
-                if (attempt < OPEN_RETRY_COUNT) {
-                    camera?.let { releaseCamera(it) }
-                    camera = null
-                    delay(CAMERA_RELEASE_SETTLE_MILLIS)
-                }
-            }
-        }
-        throw CameraException.DeviceUnavailableException(
-            "Camera1 open failed for camera id $cameraId.",
-            lastFailure,
-        )
+    private fun clearSession(
+        failure: CameraException = CameraException.PreviewBindingException("Camera1 preview session stopped."),
+    ): Camera? {
+        val cameraToRelease = camera
+        camera = null
+        previewActive = false
+        activeCameraId = null
+        latestFrame = null
+        lastFrameAtMs = 0L
+        sessionFailure = null
+        firstFrameWaiter?.completeExceptionally(failure)
+        firstFrameWaiter = null
+        captureWaiter?.completeExceptionally(failure)
+        captureWaiter = null
+        return cameraToRelease
     }
 
     private fun releaseCamera(cameraToRelease: Camera) {
+        runCatching { cameraToRelease.setErrorCallback(null) }
         runCatching {
             cameraToRelease.setPreviewCallbackWithBuffer(null)
         }.onFailure {
@@ -371,17 +405,21 @@ class Camera1CameraDriver(
         data: ByteArray?,
         source: Camera?,
         frameConfig: FrameDeliveryConfig,
+        width: Int,
+        height: Int,
+        useCallbackBuffers: Boolean,
     ) {
+        // A queued callback from the previous camera must never seed the new session.
+        if (closed || source == null || source !== camera || sessionFailure != null) return
         try {
-            val previewSize = source?.parameters?.previewSize
-            if (data == null || previewSize == null) {
-                return
+            if (data == null || data.size < width * height * 3 / 2) {
+                throw CameraException.CaptureFailureException("Camera1 returned an empty or undersized NV21 preview frame.")
             }
             val config = currentConfig ?: CameraConfig()
             val rotated = rotateNv21(
                 nv21 = data.copyOf(),
-                width = previewSize.width,
-                height = previewSize.height,
+                width = width,
+                height = height,
                 rotationDegrees = config.frameRotationDegrees,
             )
             val frame = CameraFrame(
@@ -391,6 +429,7 @@ class Camera1CameraDriver(
                 rotationDegrees = 0,
             )
             latestFrame = frame
+            firstFrameWaiter?.complete(frame)
             captureWaiter?.takeIf { !it.isCompleted }?.complete(frame)
             captureWaiter = null
 
@@ -398,26 +437,40 @@ class Camera1CameraDriver(
             if (frameConfig.enabled && now - lastFrameAtMs >= frameConfig.minIntervalMillis) {
                 lastFrameAtMs = now
                 scope.launch {
-                    frameFlow.emit(frame)
+                    if (!closed && source === camera && sessionFailure == null) frameFlow.emit(frame)
                 }
             }
         } catch (throwable: Throwable) {
-            scope.launch {
-                eventFlow.emit(
-                    CameraEvent.Error(
-                        CameraException.CaptureFailureException(
-                            "Camera1 frame pipeline failed.",
-                            throwable,
-                        )
-                    )
-                )
-            }
+            failSession(source, CameraException.CaptureFailureException("Camera1 frame pipeline failed.", throwable))
         } finally {
-            if (data != null) {
+            if (useCallbackBuffers && data != null && source === camera && sessionFailure == null && !closed) {
                 runCatching {
-                    source?.addCallbackBuffer(data)
+                    source.addCallbackBuffer(data)
                 }.onFailure {
                     logger.error("Camera1CameraDriver", "Failed to return Camera1 preview buffer.", it)
+                }
+            }
+        }
+    }
+
+    private fun failSession(source: Camera?, exception: CameraException) {
+        if (closed || source == null || source !== camera || sessionFailure != null) return
+        val wasPreviewActive = previewActive
+        sessionFailure = exception
+        previewActive = false
+        latestFrame = null
+        firstFrameWaiter?.completeExceptionally(exception)
+        captureWaiter?.completeExceptionally(exception)
+        logger.error("Camera1CameraDriver", exception.message.orEmpty(), exception)
+        // Startup failures are handled by startInternal's bounded retry. Only publish an
+        // unsolicited error for a session which had already reported a valid preview.
+        if (wasPreviewActive) {
+            scope.launch {
+                operationMutex.withLock {
+                    if (camera === source) {
+                        stopInternal(emitEvent = true)
+                        eventFlow.emit(CameraEvent.Error(exception))
+                    }
                 }
             }
         }
