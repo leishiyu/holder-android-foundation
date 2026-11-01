@@ -8,4 +8,6 @@ android {
 
 dependencies {
     implementation(project(":hardware:camera:api"))
+    testImplementation(libs.kotlinx.coroutines.test)
+    testImplementation(libs.mockito.core)
 }

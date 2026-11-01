@@ -161,6 +161,15 @@ controller.setFrameRotationDegrees(90)
 - 使用 UVC 时，需要让宿主设备支持 USB Host，并按业务场景补充设备选择逻辑
 - `driver-uvc` 自己维护 `device_filter.xml` 和对应底层依赖，主 SDK 不再把 UVC 资源散落到其他模块
 
+## Camera1 切换与异常恢复（1.1.12）
+
+- Camera1 `start` / 切换在首个有效 NV21 帧到达后才报告 `PreviewStarted`；首帧等待上限为 5 秒。
+- 打开、参数设置、预览启动或首帧失败时释放并清空整个会话，最多完整启动两次。第二次使用普通预览回调，兼容部分厂商的缓冲回调异常。
+- 切换失败保留预览意图，调用方可再次 `switchToNextCamera()` 或 `start()` 重试；显式 `stop()` 后切换只选择镜头，不自动启动。
+- 已释放相机的迟到回调不会进入新会话；底层相机错误通过 `CameraEvent.Error` 上报。未就绪时 `capture` 立即失败。
+- `enableLogging = true` 时记录 cameraId、有效尺寸、尝试次数、首帧和失败原因，不记录图片内容。
+- 驱动回归测试：`./gradlew :hardware:camera:driver-camera1:testDebugUnitTest`。仍需在目标硬件验证连续切换和拍照。
+
 ## 推荐验证命令
 
 ```bash
